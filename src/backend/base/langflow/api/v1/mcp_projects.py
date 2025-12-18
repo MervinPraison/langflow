@@ -1200,17 +1200,16 @@ async def _get_mcp_composer_auth_config(project) -> dict:
     return auth_config
 
 
-settings = get_settings_service().settings
-streamable_http_stateless = settings.mcp_streamable_http_stateless
 
 # Project-specific MCP server instance for handling project-specific tools
 class ProjectMCPServer:
     def __init__(self, project_id: UUID):
         self.project_id = project_id
         self.server = Server(f"langflow-mcp-project-{project_id}")
+        settings = get_settings_service().settings
         self.session_manager = StreamableHTTPSessionManager(
             app=self.server,
-            stateless=streamable_http_stateless
+            stateless=settings.mcp_streamable_http_stateless
             )
         # since we lazily initialize the session manager's lifecycle
         # via .run(), which can only be called once, otherwise an error is raised,

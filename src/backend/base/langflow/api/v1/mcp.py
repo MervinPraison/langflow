@@ -160,8 +160,7 @@ async def handle_messages(request: Request):
 ################################################################################
 # Streamable HTTP Transport
 ################################################################################
-settings = get_settings_service().settings
-streamable_http_stateless = settings.mcp_streamable_http_stateless
+
 class StreamableHTTP:
     def __init__(self):
         self.session_manager: StreamableHTTPSessionManager | None = None
@@ -195,9 +194,10 @@ class StreamableHTTP:
                 await logger.adebug("Streamable HTTP session manager already running; skipping start")
                 return
             try:
+                settings = get_settings_service().settings
                 self.session_manager = StreamableHTTPSessionManager(
                     app=server,
-                    stateless=streamable_http_stateless
+                    stateless=settings.mcp_streamable_http_stateless
                     )
                 self._mgr_ready = asyncio.Event()
                 self._mgr_close = asyncio.Event()
