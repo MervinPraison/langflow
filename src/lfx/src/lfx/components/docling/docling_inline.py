@@ -189,7 +189,7 @@ class DoclingInlineComponent(BaseFileComponent):
         # Use threading on macOS to avoid CoreFoundation fork safety issues
         # Use multiprocessing on Linux/Windows for better performance
         if sys.platform == "darwin":  # macOS
-            queue = ThreadQueue()
+            queue: ThreadQueue = ThreadQueue()
             worker = threading.Thread(
                 target=docling_worker,
                 kwargs={
