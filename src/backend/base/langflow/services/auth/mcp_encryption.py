@@ -1,18 +1,22 @@
 """MCP Authentication encryption utilities for secure credential storage."""
 
+from copy import deepcopy
 from typing import Any
 
 from cryptography.fernet import InvalidToken
 from lfx.log.logger import logger
 
 from langflow.services.auth import utils as auth_utils
-from langflow.services.deps import get_settings_service
 
 # Fields that should be encrypted when stored
 SENSITIVE_FIELDS = [
     "oauth_client_secret",
     "api_key",
 ]
+
+# Sub-maps of an ``mcpServers`` entry whose *values* carry secrets (API keys,
+# bearer tokens) and must be encrypted at rest in the mcp_server table.
+MCP_SECRET_CONFIG_MAPS = ("env", "headers")
 
 
 def encrypt_auth_settings(auth_settings: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -27,7 +31,6 @@ def encrypt_auth_settings(auth_settings: dict[str, Any] | None) -> dict[str, Any
     if auth_settings is None:
         return None
 
-    settings_service = get_settings_service()
     encrypted_settings = auth_settings.copy()
 
     for field in SENSITIVE_FIELDS:
@@ -40,7 +43,7 @@ def encrypt_auth_settings(auth_settings: dict[str, Any] | None) -> dict[str, Any
                     logger.debug(f"Field {field} is already encrypted")
                 else:
                     # Not encrypted, encrypt it
-                    encrypted_value = auth_utils.encrypt_api_key(field_to_encrypt, settings_service)
+                    encrypted_value = auth_utils.encrypt_api_key(field_to_encrypt)
                     encrypted_settings[field] = encrypted_value
             except (ValueError, TypeError, KeyError) as e:
                 logger.error(f"Failed to encrypt field {field}: {e}")
@@ -61,7 +64,6 @@ def decrypt_auth_settings(auth_settings: dict[str, Any] | None) -> dict[str, Any
     if auth_settings is None:
         return None
 
-    settings_service = get_settings_service()
     decrypted_settings = auth_settings.copy()
 
     for field in SENSITIVE_FIELDS:
@@ -69,7 +71,7 @@ def decrypt_auth_settings(auth_settings: dict[str, Any] | None) -> dict[str, Any
             try:
                 field_to_decrypt = decrypted_settings[field]
 
-                decrypted_value = auth_utils.decrypt_api_key(field_to_decrypt, settings_service)
+                decrypted_value = auth_utils.decrypt_api_key(field_to_decrypt)
                 if not decrypted_value:
                     msg = f"Failed to decrypt field {field}"
                     raise ValueError(msg)
@@ -91,7 +93,52 @@ def decrypt_auth_settings(auth_settings: dict[str, Any] | None) -> dict[str, Any
     return decrypted_settings
 
 
-def is_encrypted(value: str) -> bool:
+def encrypt_mcp_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Encrypt secret-bearing values inside an ``mcpServers`` entry for storage.
+
+    Encrypts every value in the entry's ``env`` and ``headers`` maps (where API
+    keys and bearer tokens live) and leaves structural fields (``command``,
+    ``args``, ``url``, transport, and any extra keys) untouched. Idempotent:
+    already-encrypted values are left as-is, so re-encrypting a stored config is a
+    no-op. Returns a copy; the input is not mutated.
+    """
+    if not config:
+        return config
+
+    encrypted = deepcopy(config)
+    for map_name in MCP_SECRET_CONFIG_MAPS:
+        values = encrypted.get(map_name)
+        if not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            if isinstance(value, str) and value and not is_encrypted(value):
+                values[key] = auth_utils.encrypt_api_key(value)
+    return encrypted
+
+
+def decrypt_mcp_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Decrypt an ``mcpServers`` entry read from storage into a runnable config.
+
+    Inverse of :func:`encrypt_mcp_config`. ``decrypt_api_key`` returns non-token
+    input unchanged, so plaintext values (e.g. rows written before encryption
+    shipped, or imported legacy files) pass through untouched for backward
+    compatibility. Returns a copy; the input is not mutated.
+    """
+    if not config:
+        return config
+
+    decrypted = deepcopy(config)
+    for map_name in MCP_SECRET_CONFIG_MAPS:
+        values = decrypted.get(map_name)
+        if not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            if isinstance(value, str) and value:
+                values[key] = auth_utils.decrypt_api_key(value)
+    return decrypted
+
+
+def is_encrypted(value: str) -> bool:  # pragma: allowlist secret
     """Check if a value appears to be encrypted.
 
     Args:
@@ -103,10 +150,9 @@ def is_encrypted(value: str) -> bool:
     if not value:
         return False
 
-    settings_service = get_settings_service()
     try:
         # Try to decrypt - if it succeeds and returns a different value, it's encrypted
-        decrypted = auth_utils.decrypt_api_key(value, settings_service)
+        decrypted = auth_utils.decrypt_api_key(value)
         # If decryption returns empty string, it's encrypted with wrong key
         if not decrypted:
             return True

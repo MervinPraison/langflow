@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
-import { StickToBottom } from "use-stick-to-bottom";
+import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { StickToBottom, useStickToBottom } from "use-stick-to-bottom";
+import { SafariScrollFix } from "@/components/common/safari-scroll-fix";
 import { ChatHeader } from "@/components/core/playgroundComponent/chat-view/chat-header/components/chat-header";
 import { ChatSidebar } from "@/components/core/playgroundComponent/chat-view/chat-header/components/chat-sidebar";
 import { useSendMessage } from "@/components/core/playgroundComponent/chat-view/hooks/use-send-message";
@@ -9,12 +11,12 @@ import { useSimpleSidebar } from "@/components/ui/simple-sidebar";
 import useFlowStore from "@/stores/flowStore";
 import { useUtilityStore } from "@/stores/utilityStore";
 import type { FilePreviewType } from "@/types/components";
-import { useEditSessionInfo } from "../../chat-view/chat-header/hooks/use-edit-session-info";
-import { useGetAddSessions } from "../../chat-view/chat-header/hooks/use-get-add-sessions";
 import { ChatInput } from "../../chat-view/chat-input";
 import useDragAndDrop from "../../chat-view/chat-input/hooks/use-drag-and-drop";
 import { Messages } from "../../chat-view/chat-messages";
 import { useChatHistory } from "../../chat-view/chat-messages/hooks/use-chat-history";
+import { shouldForceScrollOnNewMessage } from "../../chat-view/utils/should-force-scroll";
+import { useSessionManager } from "../../hooks/use-session-manager";
 
 type FlowPageSlidingContainerContentProps = {
   isFullscreen: boolean;
@@ -25,71 +27,77 @@ export function FlowPageSlidingContainerContent({
   isFullscreen,
   setIsFullscreen,
 }: FlowPageSlidingContainerContentProps) {
+  const { t } = useTranslation();
   const currentFlowId = useGetFlowId();
-  const { setOpen, setWidth } = useSimpleSidebar();
-  const inputs = useFlowStore((state) => state.inputs);
-  const nodes = useFlowStore((state) => state.nodes);
+  const { open, setOpen, setWidth } = useSimpleSidebar();
+  // Select primitives, not arrays: setNodes recreates nodes/inputs on every
+  // node-drag frame, and array subscriptions re-render the whole panel.
+  const hasChatInput = useFlowStore((state) =>
+    state.inputs.some((input) => input.type === "ChatInput"),
+  );
+  const chatInputValue = useFlowStore((state) => {
+    const chatInput = state.inputs.find((input) => input.type === "ChatInput");
+    if (!chatInput) return null;
+    const node = state.nodes.find((n) => n.id === chatInput.id);
+    if (!node) return null;
+    return node.data?.node?.template?.["input_value"]?.value ?? "";
+  });
   const isBuilding = useFlowStore((state) => state.isBuilding);
   const setChatValueStore = useUtilityStore((state) => state.setChatValueStore);
 
-  const [currentSessionId, setCurrentSessionId] = useState<string | undefined>(
-    currentFlowId,
-  );
-  const [openLogsModal, setOpenLogsModal] = useState(false);
-
   const {
+    activeSessionId,
     sessions,
-    addNewSession,
-    removeLocalSession,
-    renameLocalSession,
-    fetchedSessions,
-  } = useGetAddSessions({
-    flowId: currentFlowId,
-    currentSessionId,
-  });
-  const { handleDelete } = useEditSessionInfo({
-    flowId: currentFlowId,
-    dbSessions: fetchedSessions,
-    renameLocalSession,
-  });
+    createSession,
+    deleteSession,
+    bulkDeleteSessions,
+    renameSession,
+    selectSession,
+    clearDefaultSession,
+  } = useSessionManager({ flowId: currentFlowId });
 
-  // Ensure currentFlowId is always first in sessions list
-  const orderedSessions = useMemo(() => {
-    const ordered: string[] = [];
-    const seen = new Set<string>();
-    const push = (id?: string | null) => {
-      const trimmed = id?.trim();
-      if (!trimmed || seen.has(trimmed)) return;
-      seen.add(trimmed);
-      ordered.push(trimmed);
-    };
-    // Always keep the current flow id first to avoid duplicate "Default Session"
-    push(currentFlowId);
-    // Add all other sessions
-    sessions.forEach(push);
-    return ordered;
-  }, [sessions, currentFlowId]);
-
+  const [openLogsModal, setOpenLogsModal] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [files, setFiles] = useState<FilePreviewType[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const logsModalTriggerRef = useRef<HTMLElement | null>(null);
 
-  const { sendMessage } = useSendMessage({ sessionId: currentSessionId });
-  const inputTypes = inputs.map((obj) => obj.type);
-  const noInput = !inputTypes.includes("ChatInput");
+  const { sendMessage } = useSendMessage({ sessionId: activeSessionId });
+  const noInput = !hasChatInput;
 
-  const chatHistory = useChatHistory(currentSessionId ?? currentFlowId ?? null);
+  const { chatHistory } = useChatHistory(
+    activeSessionId ?? currentFlowId ?? null,
+  );
 
   useEffect(() => {
-    const chatInput = inputs.find((input) => input.type === "ChatInput");
-    const chatInputNode = nodes.find((node) => node.id === chatInput?.id);
-
-    if (chatHistory.length === 0 && !isBuilding && chatInputNode) {
-      setChatValueStore(
-        chatInputNode.data.node.template["input_value"].value ?? "",
-      );
+    if (chatHistory.length === 0 && !isBuilding && chatInputValue !== null) {
+      setChatValueStore(chatInputValue);
     }
-  }, [chatHistory.length, isBuilding, inputs, nodes, setChatValueStore]);
+  }, [chatHistory.length, isBuilding, chatInputValue, setChatValueStore]);
+
+  const stickyInstance = useStickToBottom({
+    resize: "instant",
+    initial: "instant",
+  });
+
+  // Scroll down only when a new message is appended (last-message id change);
+  // prepending older history also grows the length and must not scroll.
+  const prevLastMsgIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const lastMsg = chatHistory[chatHistory.length - 1];
+    const lastId = lastMsg?.id;
+    if (
+      lastId &&
+      prevLastMsgIdRef.current !== undefined &&
+      lastId !== prevLastMsgIdRef.current &&
+      shouldForceScrollOnNewMessage(lastMsg)
+    ) {
+      window.dispatchEvent(new Event("langflow-scroll-to-bottom"));
+      stickyInstance.scrollToBottom("smooth");
+    }
+    prevLastMsgIdRef.current = lastId;
+  }, [chatHistory, stickyInstance]);
 
   const { dragOver, dragEnter, dragLeave } = useDragAndDrop(
     setIsDragging,
@@ -103,8 +111,37 @@ export function FlowPageSlidingContainerContent({
   };
 
   useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const outerDialog = panelRef.current?.closest('[role="dialog"]');
+      const hasNestedOverlay = Array.from(
+        document.querySelectorAll('[role="dialog"], [role="listbox"]'),
+      ).some((el) => el !== outerDialog);
+      if (hasNestedOverlay) return;
+      if (e.target instanceof Node && !panelRef.current?.contains(e.target)) {
+        return;
+      }
+      setOpen(false);
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [setOpen]);
+
+  useEffect(() => {
     setSidebarOpen(isFullscreen);
   }, [isFullscreen]);
+
+  useEffect(() => {
+    if (!open) return;
+    const raf = requestAnimationFrame(() => {
+      const chatInput = panelRef.current?.querySelector<HTMLTextAreaElement>(
+        '[data-testid="input-chat-playground"]',
+      );
+      (chatInput ?? panelRef.current)?.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [open]);
 
   const handleExitFullscreen = () => {
     setIsFullscreen(false);
@@ -120,32 +157,21 @@ export function FlowPageSlidingContainerContent({
     setIsFullscreen(true);
   };
 
-  const handleSessionSelect = (sessionId: string) => {
-    setCurrentSessionId(sessionId);
-  };
-
-  const handleNewChat = () => {
-    // Pass all sessions (including currentSessionId) to ensure unique IDs
-    const newId = addNewSession(orderedSessions);
-    setCurrentSessionId(newId);
-  };
-
-  const handleDeleteSession = (sessionId: string) => {
-    handleDelete(sessionId);
-    // Also remove from local sessions if it's a local session
-    removeLocalSession(sessionId);
-    if (sessionId === currentSessionId) {
-      setCurrentSessionId(currentFlowId);
-    }
-  };
-
-  const handleOpenLogs = (sessionId: string) => {
-    setCurrentSessionId(sessionId);
+  const handleOpenLogs = (
+    sessionId: string,
+    triggerElement: HTMLElement | null,
+  ) => {
+    selectSession(sessionId);
+    logsModalTriggerRef.current = triggerElement;
     setOpenLogsModal(true);
   };
 
   return (
     <div
+      ref={panelRef}
+      tabIndex={-1}
+      role="region"
+      aria-label={t("misc.playground")}
       className="h-full w-full muted shadow-lg flex flex-col relative z-[50] @container/chat-panel"
       onDragOver={dragOver}
       onDragEnter={dragEnter}
@@ -153,52 +179,57 @@ export function FlowPageSlidingContainerContent({
       onDrop={onDrop}
     >
       <div className="flex-1 flex overflow-hidden">
-        <AnimatedConditional isOpen={sidebarOpen} width="218px">
-          <div className="h-full overflow-y-auto border-r border-border w-218">
+        <AnimatedConditional isOpen={sidebarOpen} width="236px">
+          <div className="h-full overflow-y-auto border-r border-border w-218 bg-primary-foreground">
             <div className="p-4">
               <ChatSidebar
-                sessions={orderedSessions}
-                onNewChat={handleNewChat}
-                onSessionSelect={handleSessionSelect}
-                currentSessionId={currentSessionId}
-                onDeleteSession={handleDeleteSession}
+                sessions={sessions}
+                onNewChat={createSession}
+                onSessionSelect={selectSession}
+                currentSessionId={activeSessionId}
+                onDeleteSession={deleteSession}
                 onOpenLogs={handleOpenLogs}
-                renameLocalSession={renameLocalSession}
+                onRenameSession={renameSession}
+                onBulkDeleteSessions={bulkDeleteSessions}
               />
             </div>
           </div>
         </AnimatedConditional>
         <div className="flex-1 flex flex-col overflow-hidden pt-2">
           <ChatHeader
-            sessions={orderedSessions}
-            onNewChat={handleNewChat}
-            onSessionSelect={handleSessionSelect}
-            currentSessionId={currentSessionId}
+            sessions={sessions}
+            onNewChat={createSession}
+            onSessionSelect={selectSession}
+            currentSessionId={activeSessionId}
             currentFlowId={currentFlowId}
             onToggleFullscreen={
               isFullscreen ? handleExitFullscreen : handleEnterFullscreen
             }
             isFullscreen={isFullscreen}
-            onDeleteSession={handleDeleteSession}
+            onDeleteSession={deleteSession}
             onClose={handleClose}
             openLogsModal={openLogsModal}
             setOpenLogsModal={setOpenLogsModal}
-            renameLocalSession={renameLocalSession}
+            logsModalTriggerRef={logsModalTriggerRef}
+            onRenameSession={renameSession}
+            onClearChat={clearDefaultSession}
           />
-          <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          <div className="flex-1 flex flex-col min-h-0 overflow-hidden playground-messages-wrapper">
             <StickToBottom
+              instance={stickyInstance}
               className="flex-1 min-h-0 overflow-hidden"
-              resize="smooth"
-              initial="instant"
             >
-              <StickToBottom.Content className="flex flex-col min-h-full overflow-x-hidden p-4">
-                <div className="flex flex-col w-full">
+              <StickToBottom.Content className="flex flex-col min-h-full overflow-x-hidden ">
+                <div
+                  className={`flex flex-col ${isFullscreen ? "w-full max-w-[744px] p-0 mx-auto" : "w-full"}`}
+                >
                   <Messages
-                    visibleSession={currentSessionId ?? currentFlowId ?? null}
+                    visibleSession={activeSessionId ?? currentFlowId ?? null}
                     playgroundPage={true}
                   />
                 </div>
               </StickToBottom.Content>
+              <SafariScrollFix />
             </StickToBottom>
 
             <div
@@ -209,10 +240,10 @@ export function FlowPageSlidingContainerContent({
               >
                 <ChatInput
                   noInput={noInput}
+                  playgroundPage={true}
                   files={files}
                   setFiles={setFiles}
                   isDragging={isDragging}
-                  playgroundPage={true}
                   sendMessage={sendMessage}
                 />
               </div>

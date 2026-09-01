@@ -3,7 +3,7 @@ export const baseURL = "";
 
 export const customDefaultShortcuts = [
   {
-    display_name: "Controls",
+    display_name: "Parameters",
     name: "Advanced Settings",
     shortcut: "mod+shift+a",
   },
@@ -31,11 +31,6 @@ export const customDefaultShortcuts = [
     display_name: "Duplicate",
     name: "Duplicate",
     shortcut: "mod+d",
-  },
-  {
-    display_name: "Component Share",
-    name: "Component Share",
-    shortcut: "mod+shift+s",
   },
   {
     display_name: "Docs",
@@ -136,6 +131,11 @@ export const customDefaultShortcuts = [
     display_name: "Toggle Sidebar",
     name: "Toggle Sidebar",
     shortcut: "mod+b",
+  },
+  {
+    display_name: "AI Assistant",
+    name: "AI Assistant",
+    shortcut: "a",
   },
 ];
 export const customCodeTabsClass = {

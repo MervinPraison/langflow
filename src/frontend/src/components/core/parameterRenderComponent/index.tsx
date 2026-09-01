@@ -1,5 +1,8 @@
+import { useTranslation } from "react-i18next";
 import type { handleOnNewValueType } from "@/CustomNodes/hooks/use-handle-new-value";
 import CodeAreaComponent from "@/components/core/parameterRenderComponent/components/codeAreaComponent";
+import DataDisplayComponent from "@/components/core/parameterRenderComponent/components/dataDisplayComponent";
+import DBProviderInputComponent from "@/components/core/parameterRenderComponent/components/dbProviderInputComponent";
 import ModelInputComponent from "@/components/core/parameterRenderComponent/components/modelInputComponent";
 import SliderComponent from "@/components/core/parameterRenderComponent/components/sliderComponent";
 import TableNodeComponent from "@/components/core/parameterRenderComponent/components/TableNodeComponent";
@@ -8,14 +11,18 @@ import { TEXT_FIELD_TYPES } from "@/constants/constants";
 import CustomConnectionComponent from "@/customization/components/custom-connectionComponent";
 import CustomInputFileComponent from "@/customization/components/custom-input-file";
 import CustomLinkComponent from "@/customization/components/custom-linkComponent";
+import { ENABLE_INSPECTION_PANEL } from "@/customization/feature-flags";
 import type { APIClassType, InputFieldType } from "@/types/api";
+import AccordionPromptComponent from "./components/accordionPromptComponent";
+import ActionPickerComponent from "./components/actionPickerComponent";
 import DictComponent from "./components/dictComponent";
+import DurationComponent from "./components/durationComponent";
 import { EmptyParameterComponent } from "./components/emptyParameterComponent";
 import FloatComponent from "./components/floatComponent";
 import InputListComponent from "./components/inputListComponent";
 import IntComponent from "./components/intComponent";
 import KeypairListComponent from "./components/keypairListComponent";
-import McpComponent from "./components/mcpComponent";
+import McpComponent, { type McpServerValue } from "./components/mcpComponent";
 import MultiselectComponent from "./components/multiselectComponent";
 import MustachePromptAreaComponent from "./components/mustachePromptComponent";
 import PromptAreaComponent from "./components/promptComponent";
@@ -33,12 +40,15 @@ export function ParameterRenderComponent({
   templateData,
   templateValue,
   editNode,
+  showParameter,
+  inspectionPanel = false,
   handleNodeClass,
   nodeClass,
   disabled,
   placeholder,
   isToolMode,
   nodeInformationMetadata,
+  ariaLabelledBy,
 }: {
   handleOnNewValue:
     | handleOnNewValueType
@@ -46,16 +56,19 @@ export function ParameterRenderComponent({
   name: string;
   nodeId: string;
   templateData: Partial<InputFieldType>;
-  templateValue: any;
+  templateValue: unknown;
   editNode: boolean;
-  handleNodeClass: (value: any, code?: string, type?: string) => void;
+  showParameter: boolean;
+  inspectionPanel: boolean;
+  handleNodeClass: (value: unknown, code?: string, type?: string) => void;
   nodeClass: APIClassType;
   disabled: boolean;
   placeholder?: string;
   isToolMode?: boolean;
   nodeInformationMetadata?: NodeInfoType;
+  ariaLabelledBy?: string;
 }) {
-  // no-op
+  const { t } = useTranslation();
   const id = (
     templateData.type +
     "_" +
@@ -79,6 +92,9 @@ export function ParameterRenderComponent({
       isToolMode,
       nodeInformationMetadata,
       hasRefreshButton: templateData.refresh_button,
+      showParameter,
+      inspectionPanel,
+      ariaLabelledBy,
     };
 
     if (TEXT_FIELD_TYPES.includes(templateData.type ?? "")) {
@@ -184,7 +200,14 @@ export function ParameterRenderComponent({
           />
         );
       case "prompt":
-        return (
+        return ENABLE_INSPECTION_PANEL && !baseInputProps.editNode ? (
+          <AccordionPromptComponent
+            {...baseInputProps}
+            readonly={!!nodeClass.flow}
+            field_name={name}
+            id={`promptarea_${id}`}
+          />
+        ) : (
           <PromptAreaComponent
             {...baseInputProps}
             readonly={!!nodeClass.flow}
@@ -193,7 +216,15 @@ export function ParameterRenderComponent({
           />
         );
       case "mustache":
-        return (
+        return ENABLE_INSPECTION_PANEL && !baseInputProps.editNode ? (
+          <AccordionPromptComponent
+            {...baseInputProps}
+            readonly={!!nodeClass.flow}
+            field_name={name}
+            id={`mustachepromptarea_${id}`}
+            isDoubleBrackets={true}
+          />
+        ) : (
           <MustachePromptAreaComponent
             {...baseInputProps}
             readonly={!!nodeClass.flow}
@@ -207,7 +238,7 @@ export function ParameterRenderComponent({
         return (
           <TableNodeComponent
             {...baseInputProps}
-            description={templateData.info || "Add or edit data"}
+            description={templateData.info || t("paramRender.addOrEditData")}
             columns={
               templateData?.table_schema?.columns ?? templateData?.table_schema
             }
@@ -222,7 +253,7 @@ export function ParameterRenderComponent({
         return (
           <ToolsComponent
             {...baseInputProps}
-            description={templateData.info || "Add or edit data"}
+            description={templateData.info || t("paramRender.addOrEditData")}
             title={nodeClass?.display_name ?? "Tools"}
             icon={nodeClass?.icon ?? ""}
             template={nodeClass?.template}
@@ -256,10 +287,32 @@ export function ParameterRenderComponent({
             id={`sortablelist_${id}`}
           />
         );
+      case "duration":
+        return (
+          <DurationComponent
+            {...baseInputProps}
+            options={
+              Array.isArray(templateData.options) ? templateData.options : []
+            }
+            id={`duration_${id}`}
+          />
+        );
+      case "actionPicker":
+        return (
+          <ActionPickerComponent
+            {...baseInputProps}
+            options={
+              Array.isArray(templateData.options) ? templateData.options : []
+            }
+            combobox={templateData.combobox}
+            id={`actionpicker_${id}`}
+          />
+        );
       case "connect": {
         const link =
           templateData?.options?.find(
-            (option: any) => option?.name === templateValue,
+            (option: { name?: unknown; link?: unknown }) =>
+              option?.name === templateValue,
           )?.link || "";
 
         return (
@@ -302,7 +355,7 @@ export function ParameterRenderComponent({
             id={`mcp_${id}`}
             editNode={editNode}
             disabled={disabled}
-            value={templateValue}
+            value={templateValue as McpServerValue}
           />
         );
       case "model":
@@ -314,10 +367,34 @@ export function ParameterRenderComponent({
             externalOptions={templateData?.external_options}
           />
         );
+      case "knowledge_backend":
+        return (
+          <DBProviderInputComponent
+            {...baseInputProps}
+            id={`dbprovider_${id}`}
+          />
+        );
+      case "data_display":
+        return (
+          <DataDisplayComponent
+            {...baseInputProps}
+            buttonText={templateData?.button_text}
+            buttonIcon={templateData?.button_icon}
+            id={`data_display_${id}`}
+          />
+        );
       default:
         return <EmptyParameterComponent {...baseInputProps} />;
     }
   };
 
+  // No wrapping role="group" here: a screen reader announces a group's own
+  // name on entry, then the focused control's name right after — since
+  // every widget that actually applies ariaLabelledBy composes the same
+  // field label into its own accessible name, a wrapper would double up
+  // ("Model Name" from the group, then "Model Name gpt-4" from the
+  // combobox). Widgets that don't yet apply it themselves get nothing from
+  // wrapping either way — role="group" doesn't propagate a name to a
+  // focused descendant control, only to the group boundary itself.
   return renderComponent();
 }

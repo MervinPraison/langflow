@@ -3,19 +3,24 @@ import tempfile
 from pathlib import Path
 
 from lfx.base.agents.agent import LCAgentComponent
+from lfx.base.agents.utils import resolve_agent_verbose
 from lfx.base.data.storage_utils import read_file_bytes
+from lfx.base.models.unified_models import get_language_model_options, get_llm, handle_model_input_update
+from lfx.base.models.watsonx_constants import IBM_WATSONX_URLS
 from lfx.field_typing import AgentExecutor
 from lfx.inputs.inputs import (
     DictInput,
     DropdownInput,
     FileInput,
-    HandleInput,
     MessageTextInput,
+    ModelInput,
 )
+from lfx.io import BoolInput, SecretStrInput, StrInput
 from lfx.schema.message import Message
 from lfx.services.deps import get_settings_service
 from lfx.template.field.base import Output
 from lfx.utils.async_helpers import run_until_complete
+from lfx.utils.file_path_security import component_file_access_scopes, enforce_local_file_access
 
 
 class CSVAgentComponent(LCAgentComponent):
@@ -27,12 +32,35 @@ class CSVAgentComponent(LCAgentComponent):
 
     inputs = [
         *LCAgentComponent.get_base_inputs(),
-        HandleInput(
-            name="llm",
+        ModelInput(
+            name="model",
             display_name="Language Model",
-            input_types=["LanguageModel"],
+            info="Select your model provider or connect a Language Model component.",
+            real_time_refresh=True,
             required=True,
-            info="An LLM Model Object (It can be found in any LLM Component).",
+        ),
+        SecretStrInput(
+            name="api_key",
+            display_name="API Key",
+            info="Overrides global provider settings. Leave blank to use your pre-configured API Key.",
+            real_time_refresh=True,
+            advanced=True,
+        ),
+        DropdownInput(
+            name="base_url_ibm_watsonx",
+            display_name="watsonx API Endpoint",
+            info="The base URL of the API (IBM watsonx.ai only)",
+            options=IBM_WATSONX_URLS,
+            value=IBM_WATSONX_URLS[0],
+            show=False,
+            real_time_refresh=True,
+        ),
+        StrInput(
+            name="project_id",
+            display_name="watsonx Project ID",
+            info="The project ID associated with the foundation model (IBM watsonx.ai only)",
+            show=False,
+            required=False,
         ),
         FileInput(
             name="path",
@@ -54,6 +82,12 @@ class CSVAgentComponent(LCAgentComponent):
             display_name="Text",
             info="Text to be passed as input and extract info from the CSV File.",
             required=True,
+            # Redeclared here because this input shadows LCAgentComponent's
+            # `input_value`, which carries tool_mode=True. The runtime scans the
+            # inputs list and still sees the base one, but the serialized template
+            # is keyed by name and keeps only this one — so without the flag the
+            # index reports CSVAgent as not tool-capable when it is.
+            tool_mode=True,
         ),
         DictInput(
             name="pandas_kwargs",
@@ -61,6 +95,18 @@ class CSVAgentComponent(LCAgentComponent):
             info="Pandas Kwargs to be passed to the agent.",
             advanced=True,
             is_list=True,
+        ),
+        BoolInput(
+            name="allow_dangerous_code",
+            display_name="Allow Dangerous Code",
+            value=False,
+            required=True,
+            info=(
+                "SECURITY WARNING: Enabling this allows the agent to execute arbitrary Python code "
+                "on the server, which can lead to remote code execution vulnerabilities. "
+                "Only enable this if you fully trust the input sources and understand the security implications. "
+                "When disabled, the agent can still analyze CSV data but cannot execute custom Python code."
+            ),
         ),
     ]
 
@@ -74,6 +120,27 @@ class CSVAgentComponent(LCAgentComponent):
             return self.path.text
         return self.path
 
+    def _get_llm(self):
+        """Resolve the language model from dropdown selection or connected component."""
+        return get_llm(
+            model=self.model,
+            user_id=self.user_id,
+            api_key=getattr(self, "api_key", None),
+            watsonx_url=getattr(self, "base_url_ibm_watsonx", None),
+            watsonx_project_id=getattr(self, "project_id", None),
+        )
+
+    def update_build_config(self, build_config: dict, field_value: str, field_name: str | None = None) -> dict:
+        """Dynamically update build config with user-filtered model options (tool-calling capable models)."""
+        return handle_model_input_update(
+            self,
+            dict(build_config),
+            field_value,
+            field_name,
+            cache_key_prefix="language_model_options_tool_calling",
+            get_options_func=lambda user_id=None: get_language_model_options(user_id=user_id, tool_calling=True),
+        )
+
     def build_agent_response(self) -> Message:
         """Build and execute the CSV agent, returning the response."""
         try:
@@ -85,16 +152,23 @@ class CSVAgentComponent(LCAgentComponent):
             raise ImportError(msg) from e
 
         try:
+            # Use False as default if allow_dangerous_code is not set (secure by default)
+            allow_dangerous = getattr(self, "allow_dangerous_code", False) or False
+
             agent_kwargs = {
-                "verbose": self.verbose,
-                "allow_dangerous_code": True,
+                # Gate LangChain's stdout chain markers on LANGCHAIN_VERBOSE (off by
+                # default) instead of the always-True component input. See
+                # resolve_agent_verbose().
+                "verbose": resolve_agent_verbose(),
+                "allow_dangerous_code": allow_dangerous,
             }
 
             # Get local path (downloads from S3 if needed)
             local_path = self._get_local_path()
+            llm = self._get_llm()
 
             agent_csv = create_csv_agent(
-                llm=self.llm,
+                llm=llm,
                 path=local_path,
                 agent_type=self.agent_type,
                 handle_parsing_errors=self.handle_parsing_errors,
@@ -118,16 +192,23 @@ class CSVAgentComponent(LCAgentComponent):
             )
             raise ImportError(msg) from e
 
+        # Use False as default if allow_dangerous_code is not set (secure by default)
+        allow_dangerous = getattr(self, "allow_dangerous_code", False) or False
+
         agent_kwargs = {
-            "verbose": self.verbose,
-            "allow_dangerous_code": True,
+            # Gate LangChain's stdout chain markers on LANGCHAIN_VERBOSE (off by
+            # default) instead of the always-True component input. See
+            # resolve_agent_verbose().
+            "verbose": resolve_agent_verbose(),
+            "allow_dangerous_code": allow_dangerous,
         }
 
         # Get local path (downloads from S3 if needed)
         local_path = self._get_local_path()
+        llm = self._get_llm()
 
         agent_csv = create_csv_agent(
-            llm=self.llm,
+            llm=llm,
             path=local_path,
             agent_type=self.agent_type,
             handle_parsing_errors=self.handle_parsing_errors,
@@ -152,8 +233,10 @@ class CSVAgentComponent(LCAgentComponent):
 
         # If using S3 storage, download the file to temp
         if settings.storage_type == "s3":
-            # Download from S3 to temp file
-            csv_bytes = run_until_complete(read_file_bytes(file_path))
+            # Download from S3 to temp file. A genuine absolute local path is read from disk
+            # instead of S3 (#13798), so hand the reader the same scoped confinement the
+            # local-storage branch below applies.
+            csv_bytes = run_until_complete(read_file_bytes(file_path, resolve_path=self._confine_local_path))
 
             # Create temp file with .csv extension
             suffix = Path(file_path.split("/")[-1]).suffix or ".csv"
@@ -165,8 +248,13 @@ class CSVAgentComponent(LCAgentComponent):
             self._temp_file_path = temp_path
             return temp_path
 
-        # Local storage - return path as-is
-        return file_path
+        # Local storage - confine tenant-controlled path to the storage dir when
+        # LANGFLOW_RESTRICT_LOCAL_FILE_ACCESS is enabled (blocks /etc/passwd etc.).
+        return self._confine_local_path(file_path)
+
+    def _confine_local_path(self, path: str) -> str:
+        """Confine a tenant-controlled local path to this component's storage scope."""
+        return str(enforce_local_file_access(path, scope_ids=component_file_access_scopes(self)))
 
     def _cleanup_temp_file(self) -> None:
         """Clean up temporary file if one was created."""

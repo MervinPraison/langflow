@@ -5,6 +5,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { PanelLeft } from "lucide-react";
 import * as React from "react";
 import { useHotkeys } from "react-hotkeys-hook";
+import { useTranslation } from "react-i18next";
 import { useIsMobile } from "@/hooks/use-mobile";
 import isWrappedWithClass from "../../pages/FlowPage/components/PageComponent/utils/is-wrapped-with-class";
 import { useShortcutsStore } from "../../stores/shortcuts";
@@ -28,7 +29,10 @@ export type SidebarSection =
   | "components"
   | "bundles"
   | "mcp"
-  | "add_note";
+  | "versions"
+  | "traces"
+  | "memories"
+  | "agent";
 
 // Helper function to get cookie value
 function getCookie(name: string): string | null {
@@ -60,6 +64,7 @@ function getInitialSidebarSection(
   ) {
     return cookieValue;
   }
+  // "versions" is not persisted — always start on a content section after refresh
   return defaultSection;
 }
 
@@ -261,6 +266,24 @@ const Sidebar = React.forwardRef<
   ) => {
     const { state, setOpen, defaultOpen } = useSidebar();
     const isMobile = useIsMobile();
+    const {
+      "aria-label": ariaLabel,
+      "aria-labelledby": ariaLabelledBy,
+      role,
+    } = props;
+    const SidebarRoot =
+      role === "navigation"
+        ? "nav"
+        : ariaLabel || ariaLabelledBy
+          ? "aside"
+          : "div";
+    const rootProps =
+      role === "navigation" ? { ...props, role: undefined } : props;
+    const contentProps = {
+      ...rootProps,
+      "aria-label": undefined,
+      "aria-labelledby": undefined,
+    };
 
     React.useEffect(() => {
       if (collapsible === "none") {
@@ -282,11 +305,11 @@ const Sidebar = React.forwardRef<
 
     if (collapsible === "none") {
       return (
-        <div
+        <SidebarRoot
           className={cn("group flex h-full flex-col")}
           data-side={side}
           ref={ref}
-          {...props}
+          {...rootProps}
         >
           <div
             data-sidebar="sidebar"
@@ -297,23 +320,26 @@ const Sidebar = React.forwardRef<
           >
             {children}
           </div>
-        </div>
+        </SidebarRoot>
       );
     }
 
     return (
-      <div
+      <SidebarRoot
         ref={ref}
         className="group peer relative block h-full flex-col"
+        aria-label={ariaLabel}
+        aria-labelledby={ariaLabelledBy}
         data-state={state}
         data-collapsible={state === "collapsed" ? collapsible : ""}
         data-variant={variant}
         data-side={side}
+        role={role === "navigation" ? undefined : role}
       >
         {/* This is what handles the sidebar gap on desktop */}
         <div
           className={cn(
-            "relative h-full w-[--sidebar-width] bg-transparent transition-[width] duration-200 ease-linear",
+            "relative h-full w-[--sidebar-width] bg-transparent transition-[width] duration-300 ease-in-out",
             "group-data-[collapsible=offcanvas]:w-0",
             "group-data-[side=right]:rotate-180",
             variant === "floating" || variant === "inset"
@@ -327,7 +353,7 @@ const Sidebar = React.forwardRef<
         />
         <div
           className={cn(
-            "absolute inset-y-0 z-50 flex h-full transition-[left,right,width] duration-200 ease-linear",
+            "absolute inset-y-0 z-50 flex h-full transition-[left,right,width] duration-300 ease-in-out",
             // Adjust width based on state and device
             "w-[--sidebar-width]",
             "max-sm:group-data-[state=collapsed]:w-[--sidebar-width-icon]",
@@ -342,7 +368,7 @@ const Sidebar = React.forwardRef<
             "max-sm:absolute max-sm:h-[100%] max-sm:group-data-[state=expanded]:bg-background/80",
             className,
           )}
-          {...props}
+          {...contentProps}
         >
           <div
             data-sidebar="sidebar"
@@ -356,7 +382,7 @@ const Sidebar = React.forwardRef<
             {children}
           </div>
         </div>
-      </div>
+      </SidebarRoot>
     );
   },
 );
@@ -365,54 +391,69 @@ Sidebar.displayName = "Sidebar";
 const SidebarTrigger = React.forwardRef<
   React.ElementRef<typeof Button>,
   React.ComponentProps<typeof Button>
->(({ className, onClick, ...props }, ref) => {
-  const { toggleSidebar } = useSidebar();
-
-  const handleClick = React.useCallback(
-    (event: React.MouseEvent<HTMLButtonElement>) => {
-      onClick?.(event);
-      toggleSidebar();
+>(
+  (
+    {
+      className,
+      onClick,
+      children,
+      "aria-label": ariaLabel,
+      "aria-labelledby": ariaLabelledBy,
+      title,
+      ...props
     },
-    [onClick, toggleSidebar],
-  );
+    ref,
+  ) => {
+    const { t } = useTranslation();
+    const { toggleSidebar } = useSidebar();
+    const hasAccessibleName = Boolean(ariaLabel || ariaLabelledBy || title);
 
-  return (
-    <Button
-      ref={ref}
-      data-sidebar="trigger"
-      variant="ghost"
-      size="icon"
-      className={cn("h-7 w-7 text-muted-foreground", className)}
-      onClick={handleClick}
-      {...props}
-    >
-      {props.children ? (
-        props.children
-      ) : (
-        <>
-          <PanelLeft />
-          <span className="sr-only">Toggle Sidebar</span>
-        </>
-      )}
-    </Button>
-  );
-});
+    const handleClick = React.useCallback(
+      (event: React.MouseEvent<HTMLButtonElement>) => {
+        onClick?.(event);
+        toggleSidebar();
+      },
+      [onClick, toggleSidebar],
+    );
+
+    return (
+      <Button
+        ref={ref}
+        data-sidebar="trigger"
+        variant="ghost"
+        size="icon"
+        className={cn("h-7 w-7 text-muted-foreground", className)}
+        onClick={handleClick}
+        aria-label={ariaLabel}
+        aria-labelledby={ariaLabelledBy}
+        title={title}
+        {...props}
+      >
+        {children ? children : <PanelLeft aria-hidden="true" />}
+        {!hasAccessibleName && (
+          <span className="sr-only">{t("ui.toggleSidebar")}</span>
+        )}
+      </Button>
+    );
+  },
+);
 SidebarTrigger.displayName = "SidebarTrigger";
 
 const SidebarRail = React.forwardRef<
   HTMLButtonElement,
   React.ComponentProps<"button">
 >(({ className, ...props }, ref) => {
+  const { t } = useTranslation();
   const { toggleSidebar } = useSidebar();
 
   return (
     <button
       ref={ref}
       data-sidebar="rail"
-      aria-label="Toggle Sidebar"
+      aria-label={t("ui.toggleSidebar")}
       tabIndex={-1}
       onClick={toggleSidebar}
-      title="Toggle Sidebar"
+      title={t("ui.toggleSidebar")}
       className={cn(
         "absolute inset-y-0 z-20 hidden w-4 -translate-x-1/2 transition-all ease-linear after:absolute after:inset-y-0 after:left-1/2 after:w-[2px] hover:after:bg-border group-data-[side=left]:-right-4 group-data-[side=right]:left-0 sm:flex",
         "[[data-side=left]_&]:cursor-w-resize [[data-side=right]_&]:cursor-e-resize",

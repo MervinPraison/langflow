@@ -85,6 +85,21 @@ export const updateMessage = (updatedMessage: Message) => {
         existingMessage.sender_name || newMessage.sender_name;
       newMessage.timestamp = existingMessage.timestamp || newMessage.timestamp;
       newMessage.files = existingMessage.files || newMessage.files;
+      // Preserve agent-step tool blocks (and any other content blocks /
+      // category / properties.source) attached by prior `add_message` events.
+      // Token-event payloads from the backend don't carry these — without
+      // this preservation the first streamed chunk clobbers the cached
+      // content_blocks and the Playground "Agent Steps" panel goes blank.
+      // (QA UI-014.)
+      newMessage.content_blocks =
+        newMessage.content_blocks ?? existingMessage.content_blocks;
+      newMessage.category = newMessage.category ?? existingMessage.category;
+      if (existingMessage.properties || newMessage.properties) {
+        newMessage.properties = {
+          ...(existingMessage.properties ?? {}),
+          ...(newMessage.properties ?? {}),
+        };
+      }
     } else if (isStreamingToken && !existingMessage) {
       // First token - ensure we have all required fields
       if (!newMessage.id) {
@@ -143,6 +158,21 @@ export const updateMessage = (updatedMessage: Message) => {
   // setQueryData automatically notifies observers - no need to invalidate
 };
 
+export const removePlaceholderUserMessage = (
+  sessionId: string,
+  flowId: string,
+) => {
+  const cacheKey = [MESSAGES_QUERY_KEY, { id: flowId, session_id: sessionId }];
+
+  queryClient.setQueryData(cacheKey, (old: Message[] = []) => {
+    const placeholderIndex = old.findIndex(
+      (msg) => msg.id === null && msg.sender === "User",
+    );
+    if (placeholderIndex === -1) return old;
+    return old.filter((_, idx) => idx !== placeholderIndex);
+  });
+};
+
 export const addUserMessage = (updatedMessage: Message) => {
   const cacheKey = [
     MESSAGES_QUERY_KEY,
@@ -196,13 +226,42 @@ export const removeMessages = (
   );
 };
 
-export const findLastBotMessage = (): {
+/**
+ * Find the last bot message in the messages cache.
+ * When flowId and sessionId are provided, only the message list for that
+ * session is considered (fixes duration being applied to wrong session).
+ */
+export const findLastBotMessage = (
+  flowId?: string,
+  sessionId?: string,
+): {
   message: Message;
   queryKey: unknown[];
 } | null => {
   const cache = queryClient.getQueryCache();
-  const queries = cache.getAll();
 
+  if (
+    flowId != null &&
+    flowId !== "" &&
+    sessionId != null &&
+    sessionId !== ""
+  ) {
+    const queryKey = [
+      MESSAGES_QUERY_KEY,
+      { id: flowId, session_id: sessionId },
+    ];
+    const messages = queryClient.getQueryData<Message[]>(queryKey);
+    if (!Array.isArray(messages)) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.sender === BOT_SENDER && msg.id) {
+        return { message: msg, queryKey };
+      }
+    }
+    return null;
+  }
+
+  const queries = cache.getAll();
   for (const query of queries) {
     const queryKey = query.queryKey;
     if (!Array.isArray(queryKey) || queryKey[0] !== MESSAGES_QUERY_KEY) {
@@ -244,32 +303,35 @@ export const clearSessionMessages = (sessionId: string, flowId: string) => {
     () => [],
   );
 
-  // For default session, also clear messages with null session_id (legacy)
-  if (isDefaultSession) {
-    // Get all messages from the main query cache and filter out default session messages
-    const mainQueryKey = [MESSAGES_QUERY_KEY, { id: flowId }];
-    const mainCache = queryClient.getQueryData<{ rows?: { data?: Message[] } }>(
-      mainQueryKey,
-    );
+  // Always filter out messages from the main query cache to prevent them from reappearing
+  const mainQueryKey = [MESSAGES_QUERY_KEY, { id: flowId }];
+  const mainCache = queryClient.getQueryData<{ rows?: { data?: Message[] } }>(
+    mainQueryKey,
+  );
 
-    if (mainCache?.rows?.data) {
-      // Filter out messages that belong to default session (including null session_id)
-      const filteredMessages = mainCache.rows.data.filter((msg) => {
-        // Keep messages that don't belong to this flow or have a different session_id
-        if (msg.flow_id !== flowId) return true;
-        // For default session, remove messages with null session_id or matching session_id
+  if (mainCache?.rows?.data) {
+    // Filter out messages that belong to the session being cleared
+    const filteredMessages = mainCache.rows.data.filter((msg) => {
+      // Keep messages that don't belong to this flow
+      if (msg.flow_id !== flowId) return true;
+
+      // For default session, remove messages with null session_id or matching session_id
+      if (isDefaultSession) {
         return msg.session_id !== null && msg.session_id !== sessionId;
-      });
+      }
 
-      // Update the main cache without invalidating (to prevent refetch)
-      queryClient.setQueryData(mainQueryKey, {
-        ...mainCache,
-        rows: {
-          ...mainCache.rows,
-          data: filteredMessages,
-        },
-      });
-    }
+      // For non-default sessions, remove messages with matching session_id
+      return msg.session_id !== sessionId;
+    });
+
+    // Update the main cache without invalidating (to prevent refetch)
+    queryClient.setQueryData(mainQueryKey, {
+      ...mainCache,
+      rows: {
+        ...mainCache.rows,
+        data: filteredMessages,
+      },
+    });
   }
 
   // Remove queries instead of invalidating to prevent refetch that brings messages back

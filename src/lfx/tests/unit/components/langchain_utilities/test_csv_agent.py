@@ -15,10 +15,26 @@ class TestCSVAgentComponent:
         return CSVAgentComponent
 
     @pytest.fixture
-    def default_kwargs(self):
+    def model_value(self):
+        """Return a valid ModelInput value for tests."""
+        return [
+            {
+                "name": "gpt-4o",
+                "provider": "OpenAI",
+                "icon": "OpenAI",
+                "metadata": {
+                    "model_class": "ChatOpenAI",
+                    "model_name_param": "model",
+                    "api_key_param": "api_key",
+                },
+            }
+        ]
+
+    @pytest.fixture
+    def default_kwargs(self, model_value):
         """Return the default kwargs for the component."""
         return {
-            "llm": MagicMock(),
+            "model": model_value,
             "path": "/tmp/test.csv",
             "agent_type": "openai-tools",
             "input_value": "What is the sum of column A?",
@@ -62,13 +78,13 @@ class TestCSVAgentComponent:
         assert component.agent_type == "openai-tools"
         assert component.input_value == "What is the sum of column A?"
 
-    def test_path_message_input(self, component_class):
+    def test_path_message_input(self, component_class, model_value):
         """Test that path can be provided as Message object."""
         component = component_class()
         message = Message(text="/tmp/test.csv")
         component.set_attributes(
             {
-                "llm": MagicMock(),
+                "model": model_value,
                 "path": message,
                 "agent_type": "openai-tools",
                 "input_value": "test query",
@@ -76,12 +92,12 @@ class TestCSVAgentComponent:
         )
         assert component._path() == "/tmp/test.csv"
 
-    def test_path_string_input(self, component_class):
+    def test_path_string_input(self, component_class, model_value):
         """Test that path can be provided as string."""
         component = component_class()
         component.set_attributes(
             {
-                "llm": MagicMock(),
+                "model": model_value,
                 "path": "/tmp/test.csv",
                 "agent_type": "openai-tools",
                 "input_value": "test query",
@@ -89,12 +105,12 @@ class TestCSVAgentComponent:
         )
         assert component._path() == "/tmp/test.csv"
 
-    def test_get_local_path_with_local_file(self, component_class):
+    def test_get_local_path_with_local_file(self, component_class, model_value):
         """Test _get_local_path returns path as-is for local storage."""
         component = component_class()
         component.set_attributes(
             {
-                "llm": MagicMock(),
+                "model": model_value,
                 "path": "/tmp/test.csv",
                 "agent_type": "openai-tools",
                 "input_value": "test",
@@ -112,13 +128,13 @@ class TestCSVAgentComponent:
             # Should not have created temp file path
             assert not hasattr(component, "_temp_file_path")
 
-    def test_get_local_path_with_s3_file(self, component_class):
+    def test_get_local_path_with_s3_file(self, component_class, model_value):
         """Test _get_local_path downloads S3 files to temp."""
         component = component_class()
         s3_path = "flow_123/data.csv"
         component.set_attributes(
             {
-                "llm": MagicMock(),
+                "model": model_value,
                 "path": s3_path,
                 "agent_type": "openai-tools",
                 "input_value": "test",
@@ -156,7 +172,7 @@ class TestCSVAgentComponent:
             component._cleanup_temp_file()
             assert not Path(local_path).exists()
 
-    def test_get_local_path_with_absolute_path_no_download(self, component_class):
+    def test_get_local_path_with_absolute_path_no_download(self, component_class, model_value):
         """Test that local files are used directly when storage is local."""
         component = component_class()
 
@@ -168,7 +184,7 @@ class TestCSVAgentComponent:
         try:
             component.set_attributes(
                 {
-                    "llm": MagicMock(),
+                    "model": model_value,
                     "path": temp_file,
                     "agent_type": "openai-tools",
                     "input_value": "test",
@@ -218,7 +234,7 @@ class TestCSVAgentComponent:
         # Should not raise an error
         component._cleanup_temp_file()
 
-    def test_build_agent_response_with_local_file(self, component_class, mock_langchain_experimental):
+    def test_build_agent_response_with_local_file(self, component_class, model_value, mock_langchain_experimental):
         """Test build_agent_response with local CSV file."""
         component = component_class()
 
@@ -230,7 +246,7 @@ class TestCSVAgentComponent:
         try:
             component.set_attributes(
                 {
-                    "llm": MagicMock(),
+                    "model": model_value,
                     "path": csv_file,
                     "agent_type": "openai-tools",
                     "input_value": "What is the sum?",
@@ -241,7 +257,10 @@ class TestCSVAgentComponent:
             )
 
             # Mock settings and LangChain agent
-            with patch("lfx.components.langchain_utilities.csv_agent.get_settings_service") as mock_get_settings:
+            with (
+                patch("lfx.components.langchain_utilities.csv_agent.get_settings_service") as mock_get_settings,
+                patch.object(component, "_get_llm", return_value=MagicMock()),
+            ):
                 mock_create_agent = mock_langchain_experimental
                 mock_settings = MagicMock()
                 mock_settings.settings.storage_type = "local"
@@ -262,12 +281,12 @@ class TestCSVAgentComponent:
         finally:
             Path(csv_file).unlink()
 
-    def test_build_agent_response_with_s3_file(self, component_class, mock_langchain_experimental):
+    def test_build_agent_response_with_s3_file(self, component_class, model_value, mock_langchain_experimental):
         """Test build_agent_response with S3 CSV file (downloads to temp)."""
         component = component_class()
         component.set_attributes(
             {
-                "llm": MagicMock(),
+                "model": model_value,
                 "path": "flow_123/data.csv",
                 "agent_type": "openai-tools",
                 "input_value": "What is the total?",
@@ -285,6 +304,7 @@ class TestCSVAgentComponent:
             patch(
                 "lfx.components.langchain_utilities.csv_agent.read_file_bytes", new_callable=AsyncMock
             ) as mock_read_bytes,
+            patch.object(component, "_get_llm", return_value=MagicMock()),
         ):
             mock_create_agent = mock_langchain_experimental
             mock_settings = MagicMock()
@@ -313,12 +333,12 @@ class TestCSVAgentComponent:
             # Temp file should be cleaned up after execution
             assert not Path(created_path).exists()
 
-    def test_build_agent_response_cleans_up_on_error(self, component_class, mock_langchain_experimental):
+    def test_build_agent_response_cleans_up_on_error(self, component_class, model_value, mock_langchain_experimental):
         """Test that temp file is cleaned up even when agent execution fails."""
         component = component_class()
         component.set_attributes(
             {
-                "llm": MagicMock(),
+                "model": model_value,
                 "path": "flow_123/data.csv",
                 "agent_type": "openai-tools",
                 "input_value": "test",
@@ -336,6 +356,7 @@ class TestCSVAgentComponent:
             patch(
                 "lfx.components.langchain_utilities.csv_agent.read_file_bytes", new_callable=AsyncMock
             ) as mock_read_bytes,
+            patch.object(component, "_get_llm", return_value=MagicMock()),
         ):
             mock_create_agent = mock_langchain_experimental
             mock_create_agent.side_effect = Exception("Agent creation failed")
@@ -352,8 +373,12 @@ class TestCSVAgentComponent:
                 temp_file_path = component._temp_file_path
                 assert not Path(temp_file_path).exists()
 
-    def test_build_agent(self, component_class, mock_langchain_experimental):
-        """Test build_agent method."""
+    def test_build_agent(self, component_class, model_value, mock_langchain_experimental, monkeypatch):
+        """Test build_agent method with allow_dangerous_code explicitly set."""
+        # The stdout chain markers follow LANGCHAIN_VERBOSE (off by default), not the
+        # component's verbose input -- see resolve_agent_verbose(). Ensure it's unset so
+        # the default-off assertion below is deterministic.
+        monkeypatch.delenv("LANGCHAIN_VERBOSE", raising=False)
         component = component_class()
 
         # Create real CSV file
@@ -364,17 +389,21 @@ class TestCSVAgentComponent:
         try:
             component.set_attributes(
                 {
-                    "llm": MagicMock(),
+                    "model": model_value,
                     "path": csv_file,
                     "agent_type": "openai-tools",
                     "input_value": "test",
                     "verbose": True,
                     "handle_parsing_errors": False,
                     "pandas_kwargs": {"encoding": "utf-8"},
+                    "allow_dangerous_code": True,  # Explicitly enable for this test
                 }
             )
 
-            with patch("lfx.components.langchain_utilities.csv_agent.get_settings_service") as mock_get_settings:
+            with (
+                patch("lfx.components.langchain_utilities.csv_agent.get_settings_service") as mock_get_settings,
+                patch.object(component, "_get_llm", return_value=MagicMock()),
+            ):
                 mock_create_agent = mock_langchain_experimental
                 mock_settings = MagicMock()
                 mock_settings.settings.storage_type = "local"
@@ -388,10 +417,226 @@ class TestCSVAgentComponent:
                 assert agent == mock_agent
                 mock_create_agent.assert_called_once()
                 call_kwargs = mock_create_agent.call_args[1]
-                assert call_kwargs["verbose"] is True
+                # Default off despite the component's verbose=True input: the stdout chain
+                # markers are gated on LANGCHAIN_VERBOSE now (issue #13662).
+                assert call_kwargs["verbose"] is False
                 assert call_kwargs["allow_dangerous_code"] is True
                 assert call_kwargs["handle_parsing_errors"] is False
                 assert call_kwargs["pandas_kwargs"] == {"encoding": "utf-8"}
                 assert call_kwargs["path"] == csv_file
         finally:
             Path(csv_file).unlink()
+
+    def test_security_default_safe_no_warning(self, component_class, model_value, mock_langchain_experimental):
+        """Test that allow_dangerous_code defaults to False and no warning is logged."""
+        component = component_class()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("col1,col2\n1,a\n2,b")
+            csv_file = f.name
+
+        try:
+            # Don't set allow_dangerous_code - should default to False
+            component.set_attributes(
+                {
+                    "model": model_value,
+                    "path": csv_file,
+                    "agent_type": "openai-tools",
+                    "input_value": "test",
+                    "verbose": False,
+                    "handle_parsing_errors": True,
+                    "pandas_kwargs": {},
+                }
+            )
+
+            with (
+                patch("lfx.components.langchain_utilities.csv_agent.get_settings_service") as mock_get_settings,
+                patch.object(component, "_get_llm", return_value=MagicMock()),
+            ):
+                mock_create_agent = mock_langchain_experimental
+                mock_settings = MagicMock()
+                mock_settings.settings.storage_type = "local"
+                mock_get_settings.return_value = mock_settings
+
+                mock_agent = MagicMock()
+                mock_agent.invoke.return_value = {"output": "Safe result"}
+                mock_create_agent.return_value = mock_agent
+
+                result = component.build_agent_response()
+
+                # Verify the agent was created with allow_dangerous_code=False
+                mock_create_agent.assert_called_once()
+                call_kwargs = mock_create_agent.call_args[1]
+                assert call_kwargs["allow_dangerous_code"] is False
+
+                assert isinstance(result, Message)
+                assert result.text == "Safe result"
+        finally:
+            Path(csv_file).unlink()
+
+    def test_security_explicit_disable_no_warning(self, component_class, model_value, mock_langchain_experimental):
+        """Test that explicitly setting allow_dangerous_code=False works and no warning is logged."""
+        component = component_class()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("col1,col2\n1,a\n2,b")
+            csv_file = f.name
+
+        try:
+            # Explicitly disable dangerous code
+            component.set_attributes(
+                {
+                    "model": model_value,
+                    "path": csv_file,
+                    "agent_type": "openai-tools",
+                    "input_value": "test",
+                    "verbose": False,
+                    "handle_parsing_errors": True,
+                    "pandas_kwargs": {},
+                    "allow_dangerous_code": False,  # Explicitly disabled
+                }
+            )
+
+            with (
+                patch("lfx.components.langchain_utilities.csv_agent.get_settings_service") as mock_get_settings,
+                patch.object(component, "_get_llm", return_value=MagicMock()),
+            ):
+                mock_create_agent = mock_langchain_experimental
+                mock_settings = MagicMock()
+                mock_settings.settings.storage_type = "local"
+                mock_get_settings.return_value = mock_settings
+
+                mock_agent = MagicMock()
+                mock_agent.invoke.return_value = {"output": "Safe result"}
+                mock_create_agent.return_value = mock_agent
+
+                result = component.build_agent_response()
+
+                # Verify the agent was created with allow_dangerous_code=False
+                mock_create_agent.assert_called_once()
+                call_kwargs = mock_create_agent.call_args[1]
+                assert call_kwargs["allow_dangerous_code"] is False
+
+                assert isinstance(result, Message)
+                assert result.text == "Safe result"
+        finally:
+            Path(csv_file).unlink()
+
+    def test_security_explicit_enable_with_warning(self, component_class, model_value, mock_langchain_experimental):
+        """Test that allow_dangerous_code=True works and logs security warning."""
+        component = component_class()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("col1,col2\n1,a\n2,b")
+            csv_file = f.name
+
+        try:
+            # Explicitly enable dangerous code
+            component.set_attributes(
+                {
+                    "model": model_value,
+                    "path": csv_file,
+                    "agent_type": "openai-tools",
+                    "input_value": "test",
+                    "verbose": False,
+                    "handle_parsing_errors": True,
+                    "pandas_kwargs": {},
+                    "allow_dangerous_code": True,  # Explicitly enabled
+                }
+            )
+
+            with (
+                patch("lfx.components.langchain_utilities.csv_agent.get_settings_service") as mock_get_settings,
+                patch.object(component, "_get_llm", return_value=MagicMock()),
+            ):
+                mock_create_agent = mock_langchain_experimental
+                mock_settings = MagicMock()
+                mock_settings.settings.storage_type = "local"
+                mock_get_settings.return_value = mock_settings
+
+                mock_agent = MagicMock()
+                mock_agent.invoke.return_value = {"output": "Result with code execution"}
+                mock_create_agent.return_value = mock_agent
+
+                result = component.build_agent_response()
+
+                # Verify the agent was created with allow_dangerous_code=True
+                mock_create_agent.assert_called_once()
+                call_kwargs = mock_create_agent.call_args[1]
+                assert call_kwargs["allow_dangerous_code"] is True
+
+                assert isinstance(result, Message)
+                assert result.text == "Result with code execution"
+        finally:
+            Path(csv_file).unlink()
+
+
+class TestCSVAgentRestrictedLocalFileAccess:
+    """LANGFLOW_RESTRICT_LOCAL_FILE_ACCESS must apply on the S3 branch as well.
+
+    Under S3 storage the shared reader falls back to a direct disk read for absolute paths
+    that really exist (#13798). Without confinement that turns the tenant-controlled ``path``
+    field into an arbitrary local file read on exactly the deployments that opted into the
+    hardening flag.
+    """
+
+    @staticmethod
+    def _restricted_env(config_dir: Path, storage_type: str = "s3"):
+        settings = MagicMock()
+        settings.settings.storage_type = storage_type
+        settings.settings.restrict_local_file_access = True
+        settings.settings.config_dir = str(config_dir)
+        settings.settings.database_url = ""
+        return (
+            patch("lfx.components.langchain_utilities.csv_agent.get_settings_service", return_value=settings),
+            patch("lfx.base.data.storage_utils.get_settings_service", return_value=settings),
+            patch("lfx.utils.file_path_security.get_settings_service", return_value=settings),
+        )
+
+    @staticmethod
+    def _component(path: str):
+        component = CSVAgentComponent()
+        component.set_attributes({"llm": MagicMock(), "path": path, "agent_type": "openai-tools"})
+        component._user_id = "user-id"
+        return component
+
+    @pytest.mark.parametrize("storage_type", ["s3", "local"])
+    def test_out_of_scope_path_is_denied(self, tmp_path, storage_type):
+        """The S3 branch must refuse the same path the local branch already refuses."""
+        from lfx.utils.file_path_security import LocalFileAccessError
+
+        config_dir = tmp_path / "config"
+        (config_dir / "user-id").mkdir(parents=True)
+        outside = tmp_path / "outside.csv"
+        outside.write_text("col\nvalue\n")
+
+        component = self._component(str(outside))
+        patches = self._restricted_env(config_dir, storage_type)
+        for p in patches:
+            p.start()
+        try:
+            with pytest.raises(LocalFileAccessError):
+                component._get_local_path()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_in_scope_path_still_readable_under_s3(self, tmp_path):
+        """A file inside the caller's storage scope is still served."""
+        config_dir = tmp_path / "config"
+        scope_dir = config_dir / "user-id"
+        scope_dir.mkdir(parents=True)
+        allowed = scope_dir / "data.csv"
+        allowed.write_text("col\nvalue\n")
+
+        component = self._component(str(allowed))
+        patches = self._restricted_env(config_dir)
+        for p in patches:
+            p.start()
+        try:
+            local_path = component._get_local_path()
+            assert Path(local_path).read_text() == "col\nvalue\n"
+        finally:
+            component._cleanup_temp_file()
+            for p in patches:
+                p.stop()

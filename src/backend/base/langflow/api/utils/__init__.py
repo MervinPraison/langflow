@@ -5,7 +5,7 @@ from the core module. This ensures existing imports continue to work while
 allowing for better code organization.
 """
 
-# Re-export everything from core module to maintain backward compatibility
+# Re-export everything from core and flow_utils modules to maintain backward compatibility
 from langflow.api.utils.core import (
     API_WORDS,
     MAX_PAGE_SIZE,
@@ -13,14 +13,12 @@ from langflow.api.utils.core import (
     CurrentActiveMCPUser,
     CurrentActiveUser,
     DbSession,
+    DbSessionReadOnly,
     EventDeliveryType,
     ValidatedFileName,
-    build_and_cache_graph_from_data,
-    build_graph_from_data,
-    build_graph_from_db,
-    build_graph_from_db_no_cache,
+    ValidatedFolderName,
+    build_content_disposition,
     build_input_keys_response,
-    cascade_delete_flow,
     check_langflow_version,
     custom_params,
     extract_global_variables_from_headers,
@@ -32,11 +30,25 @@ from langflow.api.utils.core import (
     get_suggestion_message,
     get_top_level_vertices,
     has_api_terms,
+    normalize_code_for_import,
+    normalize_flow_for_export,
     parse_exception,
     parse_value,
     raise_error_if_astra_cloud_env,
+    release_db_transaction,
     remove_api_keys,
+    strip_flow_secrets,
+    strip_secret_field_values_in_place,
     validate_is_component,
+)
+from langflow.api.utils.flow_utils import (
+    build_and_cache_graph_from_data,
+    build_graph_from_data,
+    build_graph_from_db,
+    build_graph_from_db_no_cache,
+    cascade_delete_flow,
+    scope_session_to_namespace,
+    validate_public_files,
     verify_public_flow_and_get_user,
 )
 
@@ -50,10 +62,13 @@ __all__ = [
     # Type annotations
     "CurrentActiveUser",
     "DbSession",
+    "DbSessionReadOnly",
     # Enums
     "EventDeliveryType",
     "ValidatedFileName",
+    "ValidatedFolderName",
     "build_and_cache_graph_from_data",
+    "build_content_disposition",
     "build_graph_from_data",
     "build_graph_from_db",
     "build_graph_from_db_no_cache",
@@ -71,10 +86,17 @@ __all__ = [
     "get_top_level_vertices",
     # Functions
     "has_api_terms",
+    "normalize_code_for_import",
+    "normalize_flow_for_export",
     "parse_exception",
     "parse_value",
     "raise_error_if_astra_cloud_env",
+    "release_db_transaction",
     "remove_api_keys",
+    "scope_session_to_namespace",
+    "strip_flow_secrets",
+    "strip_secret_field_values_in_place",
     "validate_is_component",
+    "validate_public_files",
     "verify_public_flow_and_get_user",
 ]

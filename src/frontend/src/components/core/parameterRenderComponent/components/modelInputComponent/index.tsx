@@ -1,49 +1,64 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
-import { mutateTemplate } from "@/CustomNodes/helpers/mutate-template";
-import LoadingTextComponent from "@/components/common/loadingTextComponent";
-import { RECEIVING_INPUT_VALUE } from "@/constants/constants";
+import { BUILD_PANEL_COLLISION_PADDING_PX } from "@/constants/constants";
+import { getEnabledModelsForType } from "@/controllers/API/helpers/enabled-model-policy";
 import { useGetEnabledModels } from "@/controllers/API/queries/models/use-get-enabled-models";
 import { useGetModelProviders } from "@/controllers/API/queries/models/use-get-model-providers";
 import { usePostTemplateValue } from "@/controllers/API/queries/nodes/use-post-template-value";
+import { useRefreshModelInputs } from "@/hooks/use-refresh-model-inputs";
 import ModelProviderModal from "@/modals/modelProviderModal";
-import useAlertStore from "@/stores/alertStore";
 import useFlowStore from "@/stores/flowStore";
-import { useTypesStore } from "@/stores/typesStore";
+import useFlowsManagerStore from "@/stores/flowsManagerStore";
 import type { APIClassType } from "@/types/api";
-import { scapedJSONStringfy } from "@/utils/reactflowUtils";
-import { cn, groupByFamily } from "@/utils/utils";
+import type { NodeDataType } from "@/types/flow";
 import ForwardedIconComponent from "../../../../common/genericIconComponent";
-import { Button } from "../../../../ui/button";
-import {
-  Command,
-  CommandGroup,
-  CommandItem,
-  CommandList,
-} from "../../../../ui/command";
+import { Command } from "../../../../ui/command";
+
+/**
+ * cmdk unconditionally renders a hidden `<label htmlFor={inputId}>` inside
+ * <Command>, even when no CommandInput exists for that id — a label whose
+ * `for` references nothing (IBM label_ref_valid, WCAG 1.3.1). The listbox
+ * carries the picker's accessible name, so the reference is pure debt.
+ * Only the `for` ATTRIBUTE is removed — never the node (React owns it and
+ * would fight its removal during reconciliation; attribute edits are safe
+ * because React only rewrites props it sees change, and `htmlFor` never
+ * changes here). The `label` prop stays so the element keeps inner text:
+ * an EMPTY label just trades `label_ref_valid` for `label_content_exists`
+ * (which ignores aria-hidden), while a text-bearing label with no `for`
+ * passes every rule and is inert to screen readers — nothing references it.
+ */
+export function stripDanglingCmdkLabelFor(root: HTMLElement | null): void {
+  const label = root?.querySelector("label[cmdk-label][for]");
+  if (label && !document.getElementById(label.getAttribute("for") ?? "")) {
+    label.removeAttribute("for");
+  }
+}
+
 import {
   Popover,
+  PopoverContent,
   PopoverContentWithoutPortal,
-  PopoverTrigger,
 } from "../../../../ui/popover";
 import type { BaseInputProps } from "../../types";
-
-/** Represents a single model option in the dropdown */
-export interface ModelOption {
-  id?: string;
-  name: string;
-  icon: string;
-  provider: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface ModelInputComponentType {
-  options?: ModelOption[];
-  placeholder?: string;
-  externalOptions?: any;
-}
-
-export type SelectedModel = ModelOption;
+import {
+  focusCommandListOnOpen,
+  refocusSelectedCommandItemOnNavigate,
+} from "../../utils/focus-command-list-on-open";
+import { ModelDropdownFooter } from "./components/ModelDropdownFooter";
+import {
+  ModelInputErrorButton,
+  ModelInputLoadingButton,
+} from "./components/ModelInputStates";
+import ModelList from "./components/ModelList";
+import ModelTrigger, { isSetupProviderState } from "./components/ModelTrigger";
+import { buildGroupedOptions } from "./helpers/build-grouped-options";
+import { deriveSelectedModel } from "./helpers/derive-selected-model";
+import { matchesModelIdentity } from "./helpers/model-option-identity";
+import { useAutoSelectModel } from "./hooks/useAutoSelectModel";
+import { useModelConnectionLogic } from "./hooks/useModelConnectionLogic";
+import { useRefreshAfterProviderClose } from "./hooks/useRefreshAfterProviderClose";
+import type { ModelInputComponentType, ModelOption } from "./types";
 
 export default function ModelInputComponent({
   id,
@@ -51,146 +66,281 @@ export default function ModelInputComponent({
   disabled,
   handleOnNewValue,
   options = [],
-  placeholder = "Setup Provider",
+  placeholder,
   nodeId,
   nodeClass,
   handleNodeClass,
   externalOptions,
-}: BaseInputProps<any> & ModelInputComponentType): JSX.Element {
-  const { setErrorData } = useAlertStore();
+  showParameter = true,
+  editNode,
+  inspectionPanel,
+  showEmptyState = false,
+  modelType: modelTypeProp,
+  providerScope,
+  "aria-label": ariaLabel,
+  ariaLabelledBy,
+  ariaDescribedBy,
+  ariaInvalid,
+}: BaseInputProps<ModelOption[] | undefined> &
+  ModelInputComponentType): JSX.Element | null {
+  const { t } = useTranslation();
+  const resolvedPlaceholder = placeholder ?? t("model.setupProvider");
   const refButton = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
-  const [refreshOptions, setRefreshOptions] = useState(false);
-  const [selectedModel, setSelectedModel] = useState<SelectedModel | null>(
-    null,
-  );
   const [openManageProvidersDialog, setOpenManageProvidersDialog] =
     useState(false);
+  const [refreshOptions, setRefreshOptions] = useState(false);
+  const isBuilding = useFlowStore((state) => state.isBuilding);
+  const buildInfo = useFlowStore((state) => state.buildInfo);
+  const inspectionPanelVisible = useFlowStore(
+    (state) => state.inspectionPanelVisible,
+  );
+  const showingBuildPanel =
+    isBuilding || !!buildInfo?.error || !!buildInfo?.success;
 
-  // Ref to track if we've already processed the empty options state
-  // Prevents infinite loop when no models are available
-  const hasProcessedEmptyRef = useRef(false);
+  const isConnectionMode = useFlowStore((state) => {
+    if (!nodeId) return false;
+    const node = state.nodes.find((n) => n.id === nodeId);
+    const data = node?.data as { _connectionMode?: boolean } | undefined;
+    return data?._connectionMode === true;
+  });
 
-  const postTemplateValue = usePostTemplateValue({
+  const setConnectionMode = useCallback(
+    (enabled: boolean) => {
+      if (!nodeId) return;
+      const store = useFlowStore.getState();
+      store.setNode(
+        nodeId,
+        (node) => ({
+          ...node,
+          data: { ...node.data, _connectionMode: enabled },
+        }),
+        false,
+      );
+    },
+    [nodeId],
+  );
+
+  const { refreshAllModelInputs } = useRefreshModelInputs();
+
+  const _postTemplateValue = usePostTemplateValue({
     parameterId: "model",
     nodeId: nodeId || "",
     node: (nodeClass as APIClassType) || null,
   });
 
+  const { handleExternalOptions } = useModelConnectionLogic({
+    nodeId: nodeId || "",
+    closePopover: () => setOpen(false),
+    clearSelection: () => {
+      setConnectionMode(true);
+    },
+  });
+
   const modelType =
-    nodeClass?.template?.model?.model_type === "language"
+    modelTypeProp ??
+    (nodeClass?.template?.model?.model_type === "language"
       ? "llm"
-      : "embeddings";
+      : "embeddings");
 
-  const { data: providersData = [], isLoading: isLoadingProviders } =
-    useGetModelProviders({});
-  const { data: enabledModelsData, isLoading: isLoadingEnabledModels } =
-    useGetEnabledModels();
+  const modelFilters = useMemo(() => {
+    const raw = (
+      nodeClass?.template?.model as
+        | { filters?: Record<string, unknown> }
+        | undefined
+    )?.filters;
+    if (!raw || typeof raw !== "object") return undefined;
+    const entries = Object.entries(raw).filter(
+      ([, v]) => v !== null && v !== undefined,
+    );
+    if (entries.length === 0) return undefined;
+    return Object.fromEntries(entries) as Record<string, unknown>;
+  }, [nodeClass]);
+  const currentFlowId = useFlowsManagerStore((state) => state.currentFlowId);
+  const hasExplicitProviderScope = providerScope !== undefined;
+  const resolvedProviderScope = hasExplicitProviderScope
+    ? providerScope
+    : { flowId: currentFlowId };
+  const hasExplicitFlowScopeKey =
+    hasExplicitProviderScope && Object.hasOwn(resolvedProviderScope, "flowId");
+  const hasExplicitProjectScopeKey =
+    hasExplicitProviderScope &&
+    Object.hasOwn(resolvedProviderScope, "projectId");
+  const explicitScopeKeyCount =
+    Number(hasExplicitFlowScopeKey) + Number(hasExplicitProjectScopeKey);
+  const hasValidExplicitProviderScope =
+    explicitScopeKeyCount === 0 ||
+    (explicitScopeKeyCount === 1 &&
+      (hasExplicitFlowScopeKey
+        ? Boolean(resolvedProviderScope.flowId?.trim())
+        : Boolean(resolvedProviderScope.projectId?.trim())));
+  const hasProviderPolicyContext = hasExplicitProviderScope
+    ? hasValidExplicitProviderScope
+    : Boolean(currentFlowId);
 
-  const isLoading = isLoadingProviders || isLoadingEnabledModels;
+  const {
+    data: providersData = [],
+    isLoading: isLoadingProviders,
+    isFetching: isFetchingProviders,
+    fetchStatus: providersFetchStatus,
+    error: providersError,
+    refetch: refetchProviders,
+  } = useGetModelProviders(
+    { ...resolvedProviderScope, purpose: "use" },
+    { enabled: hasProviderPolicyContext },
+  );
+  const {
+    data: enabledModelsData,
+    isLoading: isLoadingEnabledModels,
+    isFetching: isFetchingEnabledModels,
+    fetchStatus: enabledModelsFetchStatus,
+    error: enabledModelsError,
+    refetch: refetchEnabledModels,
+  } = useGetEnabledModels({
+    ...resolvedProviderScope,
+    purpose: "use",
+    enabled: hasProviderPolicyContext,
+  });
 
-  // Determines if we should show the model selector or the "Setup Provider" button
+  const isLoading =
+    !hasProviderPolicyContext || isLoadingProviders || isLoadingEnabledModels;
+  const isPolicyPaused =
+    providersFetchStatus === "paused" || enabledModelsFetchStatus === "paused";
+  const isFetching =
+    isFetchingProviders || isFetchingEnabledModels || isPolicyPaused;
+  const hasPolicyError = !!providersError || !!enabledModelsError;
+  const providerStatusIsReliable =
+    hasProviderPolicyContext &&
+    !isFetchingProviders &&
+    providersFetchStatus !== "paused" &&
+    !providersError;
+  const modelStatusIsReliable =
+    providerStatusIsReliable &&
+    !isFetchingEnabledModels &&
+    enabledModelsFetchStatus !== "paused" &&
+    !enabledModelsError;
+  const enabledModelsForType = useMemo(
+    () =>
+      enabledModelsData
+        ? getEnabledModelsForType(enabledModelsData, modelType)
+        : undefined,
+    [enabledModelsData, modelType],
+  );
+
   const hasEnabledProviders = useMemo(() => {
-    return providersData?.some((provider) => provider.is_enabled);
-  }, [providersData]);
+    return (
+      modelStatusIsReliable &&
+      providersData?.some(
+        (provider) => provider.is_enabled || provider.is_configured,
+      )
+    );
+  }, [modelStatusIsReliable, providersData]);
 
-  // Groups models by their provider name for sectioned display in dropdown.
-  // Filters out models from disabled providers AND disabled models.
   const groupedOptions = useMemo(() => {
-    const grouped: Record<string, ModelOption[]> = {};
-    for (const option of options) {
-      if (option.metadata?.is_disabled_provider) continue;
-      const provider = option.provider || "Unknown";
+    // Query data remains cached during background refreshes and after
+    // refresh errors. Do not turn that potentially revoked snapshot into
+    // selectable options until both policy queries have settled cleanly.
+    if (!modelStatusIsReliable) return {};
+    return buildGroupedOptions({
+      options,
+      enabledModels: enabledModelsForType,
+      providers: providersData,
+      modelType,
+      savedValue: value?.[0],
+      modelFilters,
+      providerStatusIsReliable,
+    });
+  }, [
+    options,
+    enabledModelsForType,
+    providersData,
+    modelType,
+    value,
+    modelFilters,
+    providerStatusIsReliable,
+    modelStatusIsReliable,
+  ]);
 
-      // Filter out disabled models using client-side enabled models data
-      // This provides a reliable fallback when backend filtering fails
-      if (enabledModelsData?.enabled_models) {
-        const providerModels = enabledModelsData.enabled_models[provider];
-        if (providerModels && providerModels[option.name] === false) {
-          continue; // Skip disabled models
-        }
-      }
-
-      (grouped[provider] ??= []).push(option);
-    }
-    return grouped;
-  }, [options, enabledModelsData]);
-
-  // Flattened array of all enabled options for efficient lookups by name
   const flatOptions = useMemo(
     () => Object.values(groupedOptions).flat(),
     [groupedOptions],
   );
 
-  // Sync local selectedModel state with the external value prop and available options.
-  // Handles three cases: no available models (clear selection), current value exists in options (keep it),
-  // or current value is invalid/missing (select first available model).
-  useEffect(() => {
-    // Skip auto-selection when in connection mode (value is "connect_other_models" string)
-    if (value === "connect_other_models") {
-      return;
-    }
+  const selectedModel = useMemo(
+    () =>
+      deriveSelectedModel({
+        isConnectionMode,
+        connectLabel: t("modelInput.connectOtherModels"),
+        connectIcon: externalOptions?.fields?.data?.node?.icon,
+        savedValue: value?.[0],
+        flatOptions,
+        providers: providersData,
+        providerStatusIsReliable,
+        enabledModels: enabledModelsForType,
+        modelStatusIsReliable,
+      }),
+    [
+      value,
+      flatOptions,
+      isConnectionMode,
+      externalOptions,
+      providersData,
+      providerStatusIsReliable,
+      enabledModelsForType,
+      modelStatusIsReliable,
+    ],
+  );
 
-    const availableOptions = flatOptions;
-    const currentName = value?.[0]?.name;
-
-    // No available models: clear selection/value
-    if (!availableOptions || availableOptions.length === 0) {
-      // Only process empty state once to prevent infinite loop
-      if (!hasProcessedEmptyRef.current) {
-        hasProcessedEmptyRef.current = true;
-        // Only call handleOnNewValue if value is not already empty
-        if (value && Array.isArray(value) && value.length > 0) {
-          handleOnNewValue({ value: [] });
-        }
-      }
-      setSelectedModel(null);
-      return;
-    }
-
-    // Reset the empty state flag when we have options
-    hasProcessedEmptyRef.current = false;
-
-    // If current value exists in refreshed options, keep it
-    if (currentName) {
-      const existingModel = availableOptions.find(
-        (option) => option.name === currentName,
-      );
-      if (existingModel) {
-        setSelectedModel(existingModel);
-        return;
-      }
-    }
-
-    // Otherwise select the first available model
-    const firstOption = availableOptions[0];
-    const newValue = [
-      {
-        ...(firstOption.id && { id: firstOption.id }),
-        name: firstOption.name,
-        icon: firstOption.icon || "Bot",
-        provider: firstOption.provider || "Unknown",
-        metadata: firstOption.metadata ?? {},
-      },
-    ];
-
-    handleOnNewValue({ value: newValue });
-    setSelectedModel(firstOption);
-  }, [flatOptions, value, handleOnNewValue]);
+  useAutoSelectModel({
+    flatOptions,
+    value,
+    handleOnNewValue,
+    isConnectionMode,
+    providers: providersData,
+    modelStatusIsReliable,
+    enabledModels: enabledModelsForType,
+  });
 
   /**
    * Handles model selection from the dropdown.
-   * Constructs a normalized value object and propagates it to the parent.
-   * The value is wrapped in an array to match the expected format.
    */
   const handleModelSelect = useCallback(
-    (modelName: string) => {
-      const selectedOption = flatOptions.find(
-        (option) => option.name === modelName,
+    (modelName: string, provider?: string) => {
+      if (!modelStatusIsReliable) return;
+      setConnectionMode(false);
+      if (nodeId) {
+        const store = useFlowStore.getState();
+        const node = store.getNode(nodeId);
+        const nodeData = node?.data as NodeDataType | undefined;
+        if (nodeData?.node?.template?.model?._connection_mode) {
+          store.setNode(
+            nodeId,
+            (prev) => ({
+              ...prev,
+              data: {
+                ...prev.data,
+                _connectionMode: false,
+                node: {
+                  ...(prev.data as NodeDataType).node,
+                  template: {
+                    ...(prev.data as NodeDataType).node.template,
+                    model: {
+                      ...(prev.data as NodeDataType).node.template.model,
+                      _connection_mode: false,
+                    },
+                  },
+                },
+              } as NodeDataType,
+            }),
+            false,
+          );
+        }
+      }
+      const selectedOption = flatOptions.find((option) =>
+        matchesModelIdentity(option, { name: modelName, provider }),
       );
       if (!selectedOption) return;
 
-      // Build normalized value - only include id if it exists
       const newValue = [
         {
           ...(selectedOption.id && { id: selectedOption.id }),
@@ -202,329 +352,176 @@ export default function ModelInputComponent({
       ];
 
       handleOnNewValue({ value: newValue });
-      setSelectedModel(selectedOption);
-    },
-    [flatOptions, handleOnNewValue],
-  );
-
-  const handleManageProvidersDialogClose = useCallback(() => {
-    setOpenManageProvidersDialog(false);
-    // Note: Don't call handleRefreshButtonPress here - the cleanup effect in
-    // ModelProvidersContent triggers refreshAllModelInputs which properly validates
-    // model values against available options. Calling both causes a race condition
-    // where the debounced mutateTemplate overwrites the validated value.
-  }, []);
-
-  const handleExternalOptions = useCallback(
-    async (optionValue: string) => {
       setOpen(false);
-
-      // Clear the current selection UI state
-      setSelectedModel(null);
-
-      // Pass the optionValue ("connect_other_models") as both the field value and to mutateTemplate
-      // This way the backend knows we're in connection mode
-      handleOnNewValue({ value: optionValue });
-
-      await mutateTemplate(
-        optionValue,
-        nodeId!,
-        nodeClass!,
-        handleNodeClass!,
-        postTemplateValue,
-        setErrorData,
-        "model",
-        () => {
-          // Enable connection mode for connect_other_models AFTER mutation completes
-          try {
-            if (optionValue === "connect_other_models") {
-              const store = useFlowStore.getState();
-              const node = store.getNode(nodeId!);
-              const templateField = node?.data?.node?.template?.["model"];
-              if (!templateField) {
-                return;
-              }
-
-              const inputTypes: string[] =
-                (Array.isArray(templateField.input_types)
-                  ? templateField.input_types
-                  : []) || [];
-              const effectiveInputTypes =
-                inputTypes.length > 0 ? inputTypes : ["LanguageModel"];
-
-              const tooltipTitle: string =
-                (inputTypes && inputTypes.length > 0
-                  ? inputTypes.join("\n")
-                  : templateField.type) || "";
-
-              const myId = scapedJSONStringfy({
-                inputTypes: effectiveInputTypes,
-                type: templateField.type,
-                id: nodeId,
-                fieldName: "model",
-                proxy: templateField.proxy,
-              });
-
-              const typesData = useTypesStore.getState().data;
-              const grouped = groupByFamily(
-                typesData,
-                (effectiveInputTypes && effectiveInputTypes.length > 0
-                  ? effectiveInputTypes.join("\n")
-                  : tooltipTitle) || "",
-                true,
-                store.nodes,
-              );
-
-              // Build a pseudo source so compatible target handles (left side) glow
-              const pseudoSourceHandle = scapedJSONStringfy({
-                fieldName: "model",
-                id: nodeId,
-                inputTypes: effectiveInputTypes,
-                type: "str",
-              });
-
-              const filterObj = {
-                source: undefined,
-                sourceHandle: undefined,
-                target: nodeId,
-                targetHandle: pseudoSourceHandle,
-                type: "LanguageModel",
-                color: "datatype-fuchsia",
-              } as any;
-
-              // Show compatible handles glow
-              store.setFilterEdge(grouped);
-              store.setFilterType(filterObj);
-            }
-          } catch (error) {
-            console.warn("Error setting up connection mode:", error);
-          }
-        },
-      );
     },
-    [
-      nodeId,
-      nodeClass,
-      handleNodeClass,
-      postTemplateValue,
-      setErrorData,
-      handleOnNewValue,
-    ],
+    [flatOptions, handleOnNewValue, modelStatusIsReliable],
   );
 
-  const renderLoadingButton = () => (
-    <Button
-      className="dropdown-component-false-outline w-full justify-between py-2 font-normal"
-      variant="primary"
-      size="xs"
-      disabled
-    >
-      <LoadingTextComponent text="Loading models" />
-    </Button>
-  );
-
-  const renderSelectedIcon = () => {
-    if (disabled || options.length === 0) {
-      return null;
+  const handleRefreshButtonPress = useCallback(async () => {
+    setOpen(false);
+    setRefreshOptions(true);
+    try {
+      await refreshAllModelInputs({ silent: false });
+    } catch {
+    } finally {
+      setRefreshOptions(false);
     }
+  }, [refreshAllModelInputs]);
 
-    return selectedModel?.icon ? (
-      <ForwardedIconComponent
-        name={selectedModel.icon || "Bot"}
-        className="h-4 w-4 flex-shrink-0"
-      />
-    ) : null;
+  const { isRefreshingAfterClose, handleManageProvidersDialogClose } =
+    useRefreshAfterProviderClose({
+      isFetchingProviders,
+      isFetchingEnabledModels,
+      setOpenManageProvidersDialog,
+    });
+
+  const handleRetryLoad = useCallback(() => {
+    void refetchProviders();
+    void refetchEnabledModels();
+  }, [refetchProviders, refetchEnabledModels]);
+
+  // Keep the configuration dialog mounted while its own mutations invalidate
+  // the picker's policy queries. The picker still fails closed below, but the
+  // dialog must retain its selection and in-flight save state until it closes.
+  const manageProvidersDialog = openManageProvidersDialog ? (
+    <ModelProviderModal
+      open={openManageProvidersDialog}
+      onClose={handleManageProvidersDialogClose}
+      modelType={modelType || "llm"}
+      flowId={resolvedProviderScope.flowId}
+      projectId={resolvedProviderScope.projectId}
+    />
+  ) : null;
+
+  const renderPopoverContent = () => {
+    const PopoverContentInput =
+      editNode || inspectionPanel || inspectionPanelVisible
+        ? PopoverContent
+        : PopoverContentWithoutPortal;
+    return (
+      <PopoverContentInput
+        side="bottom"
+        avoidCollisions
+        onOpenAutoFocus={focusCommandListOnOpen}
+        collisionPadding={{
+          bottom: showingBuildPanel ? BUILD_PANEL_COLLISION_PADDING_PX : 0,
+        }}
+        className="noflow nowheel nopan nodelete nodrag z-[70] p-0"
+        style={{ minWidth: refButton?.current?.clientWidth ?? "200px" }}
+      >
+        {/* Section 1 — the option list (a self-contained listbox). Keeping the
+            footer actions out of <Command> stops them from being swept into the
+            listbox's composite keyboard/focus model. */}
+        {/* The picker's accessible name lives on the CommandList (the
+            listbox). cmdk also renders a hidden <label htmlFor={inputId}>
+            for a CommandInput that does not exist here — the ref strips
+            that dangling reference; see stripDanglingCmdkLabelFor. */}
+        <Command
+          ref={stripDanglingCmdkLabelFor}
+          label={t("model.selectModel")}
+          className="flex flex-col"
+          defaultValue={
+            selectedModel
+              ? `${selectedModel.provider}::${selectedModel.name}`
+              : undefined
+          }
+          onKeyDown={refocusSelectedCommandItemOnNavigate}
+        >
+          <ModelList
+            groupedOptions={groupedOptions}
+            selectedModel={selectedModel}
+            onSelect={handleModelSelect}
+          />
+        </Command>
+        <ModelDropdownFooter
+          onRefresh={handleRefreshButtonPress}
+          onManageProviders={() => setOpenManageProvidersDialog(true)}
+          externalNode={externalOptions?.fields?.data?.node}
+          onConnectOtherModels={() =>
+            handleExternalOptions("connect_other_models")
+          }
+        />
+      </PopoverContentInput>
+    );
   };
 
-  // Renders either a "Setup Provider" button (no providers) or the model selector dropdown trigger
-  const renderTriggerButton = () =>
-    !hasEnabledProviders ? (
-      <Button
-        variant="default"
-        loading={isLoading}
-        size="sm"
-        className="w-full"
-        onClick={() => setOpenManageProvidersDialog(true)}
-      >
-        <ForwardedIconComponent name="Brain" className="h-4 w-4" />
-        <div className="text-[13px]">{placeholder || "Setup Provider"}</div>
-      </Button>
-    ) : (
-      <div className="flex w-full flex-col">
-        <PopoverTrigger asChild>
-          <Button
-            disabled={disabled || options.length === 0}
-            variant="primary"
-            size="xs"
-            role="combobox"
-            ref={refButton}
-            aria-expanded={open}
-            data-testid={id}
-            className={cn(
-              "dropdown-component-false-outline py-2",
-              "no-focus-visible w-full justify-between font-normal disabled:bg-muted disabled:text-muted-foreground",
-            )}
-          >
-            <span
-              className="flex w-full items-center gap-2 overflow-hidden"
-              data-testid={`value-dropdown-${id}`}
-            >
-              {renderSelectedIcon()}
-              <span className="truncate">
-                {disabled ? (
-                  RECEIVING_INPUT_VALUE
-                ) : (
-                  <div
-                    className={cn(
-                      "truncate",
-                      !selectedModel?.name && "text-muted-foreground",
-                    )}
-                  >
-                    {selectedModel?.name || "Select a model"}
-                  </div>
-                )}
-              </span>
-            </span>
-            <ForwardedIconComponent
-              name={disabled ? "Lock" : "ChevronsUpDown"}
-              className={cn(
-                "ml-2 h-4 w-4 shrink-0 text-foreground",
-                disabled
-                  ? "text-placeholder-foreground hover:text-placeholder-foreground"
-                  : "hover:text-foreground",
-              )}
-            />
-          </Button>
-        </PopoverTrigger>
-      </div>
-    );
-
-  const footerButtonClass =
-    "w-full flex cursor-pointer items-center justify-start gap-2 truncate py-2 text-xs text-muted-foreground px-3 hover:bg-accent group";
-
-  const renderFooterButton = (
-    label: string,
-    icon: string,
-    onClick: () => void,
-    testId?: string,
-  ) => (
-    <Button
-      className={footerButtonClass}
-      unstyled
-      data-testid={testId}
-      onClick={onClick}
-    >
-      <div className="flex items-center gap-2 pl-1 group-hover:text-primary">
-        {label}
-        <ForwardedIconComponent
-          name={icon}
-          className="w-4 h-4 text-muted-foreground group-hover:text-primary"
-        />
-      </div>
-    </Button>
-  );
-
-  const renderOptionsList = () => (
-    <CommandList className="max-h-[300px] overflow-y-auto">
-      {Object.entries(groupedOptions).map(([provider, models]) => (
-        <CommandGroup className="p-0" key={provider}>
-          <div className="text-xs font-semibold my-2 ml-4 text-muted-foreground flex items-center justify-between pr-4">
-            <div className="flex items-center">{provider}</div>
-          </div>
-          {models.map((data) => (
-            <CommandItem
-              key={data.name}
-              value={data.name}
-              onSelect={() => {
-                handleModelSelect(data.name);
-                setOpen(false);
-              }}
-              className="w-full items-center rounded-none"
-              data-testid={`${data.name}-option`}
-            >
-              <div className="flex w-full items-center gap-2">
-                <ForwardedIconComponent
-                  name={data.icon || "Bot"}
-                  className="h-4 w-4 shrink-0 text-primary ml-2"
-                />
-                <div className="truncate text-[13px]">{data.name}</div>
-                <div className="pl-2 ml-auto">
-                  <ForwardedIconComponent
-                    name="Check"
-                    className={cn(
-                      "h-4 w-4 shrink-0 text-primary",
-                      selectedModel?.name === data.name
-                        ? "opacity-100"
-                        : "opacity-0",
-                    )}
-                  />
-                </div>
-              </div>
-            </CommandItem>
-          ))}
-        </CommandGroup>
-      ))}
-    </CommandList>
-  );
-
-  const renderManageProvidersButton = () => (
-    <div className="bottom-0 bg-background">
-      {renderFooterButton(
-        "Manage Model Providers",
-        "Settings",
-        () => setOpenManageProvidersDialog(true),
-        "manage-model-providers",
-      )}
-    </div>
-  );
-
-  const renderNoProviders = () => (
-    <CommandList className="max-h-[300px] overflow-y-auto">
-      <CommandItem
-        disabled
-        className="w-full px-4 py-2 text-[13px] text-muted-foreground"
-      >
-        No Models Enabled
-      </CommandItem>
-    </CommandList>
-  );
-
-  const renderPopoverContent = () => (
-    <PopoverContentWithoutPortal
-      side="bottom"
-      avoidCollisions={true}
-      className="noflow nowheel nopan nodelete nodrag p-0"
-      style={{ minWidth: refButton?.current?.clientWidth ?? "200px" }}
-    >
-      <Command className="flex flex-col">
-        {Object.keys(groupedOptions).length > 0
-          ? renderOptionsList()
-          : renderNoProviders()}
-        {renderManageProvidersButton()}
-      </Command>
-    </PopoverContentWithoutPortal>
-  );
-
-  // Loading state
-  if (!options || options.length === 0 || refreshOptions) {
-    return <div className="w-full">{renderLoadingButton()}</div>;
+  if (!showParameter) {
+    return null;
   }
+
+  if (hasPolicyError && !isFetching) {
+    return (
+      <>
+        <div className="w-full">
+          <ModelInputErrorButton onRetry={handleRetryLoad} />
+        </div>
+        {manageProvidersDialog}
+      </>
+    );
+  }
+
+  if (isLoading || isFetching || isRefreshingAfterClose || refreshOptions) {
+    return (
+      <>
+        <div className="w-full">
+          <ModelInputLoadingButton />
+        </div>
+        {manageProvidersDialog}
+      </>
+    );
+  }
+
+  const showConfigureAffordance =
+    selectedModel?.metadata?.not_enabled_locally === true &&
+    !isSetupProviderState({
+      hasEnabledProviders: hasEnabledProviders ?? false,
+      showEmptyState,
+      optionCount: flatOptions.length,
+    });
 
   // Main render
   return (
     <>
       <Popover open={open} onOpenChange={setOpen}>
-        <div className="w-full truncate">{renderTriggerButton()}</div>
+        <div className="flex w-full items-center gap-2">
+          <div className="min-w-0 flex-1 truncate">
+            <ModelTrigger
+              open={open}
+              disabled={disabled}
+              options={flatOptions}
+              selectedModel={selectedModel}
+              placeholder={resolvedPlaceholder}
+              hasEnabledProviders={hasEnabledProviders ?? false}
+              onOpenManageProviders={() => setOpenManageProvidersDialog(true)}
+              id={id}
+              refButton={refButton}
+              showEmptyState={showEmptyState}
+              aria-label={ariaLabel}
+              ariaLabelledBy={ariaLabelledBy}
+              ariaDescribedBy={ariaDescribedBy}
+              ariaInvalid={ariaInvalid}
+            />
+          </div>
+          {showConfigureAffordance && (
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                setOpenManageProvidersDialog(true);
+              }}
+              data-testid={`${id}-configure`}
+              aria-label={t("model.configureProvider")}
+              title={t("model.notEnabledTitle")}
+              className="shrink-0 inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-primary"
+            >
+              <ForwardedIconComponent name="Wrench" className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
         {renderPopoverContent()}
       </Popover>
 
-      {openManageProvidersDialog && (
-        <ModelProviderModal
-          open={openManageProvidersDialog}
-          onClose={handleManageProvidersDialogClose}
-          modelType={modelType || "llm"}
-        />
-      )}
+      {manageProvidersDialog}
     </>
   );
 }

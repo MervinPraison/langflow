@@ -2,30 +2,37 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager, suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from fastapi import HTTPException
-from sqlalchemy.exc import InvalidRequestError
 
 from lfx.log.logger import logger
+from lfx.services.config_discovery import resolve_config_dir
 from lfx.services.schema import ServiceType
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
+    from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from lfx.services.adapters.registry import AdapterRegistry
+    from lfx.services.catalog_policy.base import BaseCatalogPolicyService
     from lfx.services.interfaces import (
+        AuthServiceProtocol,
         CacheServiceProtocol,
         ChatServiceProtocol,
         DatabaseServiceProtocol,
+        DeploymentServiceProtocol,
         SettingsServiceProtocol,
         StorageServiceProtocol,
         TracingServiceProtocol,
         TransactionServiceProtocol,
         VariableServiceProtocol,
     )
+    from lfx.services.policy_bundle.base import BasePolicyBundleService
 
 
 def get_service(service_type: ServiceType, default=None):
@@ -56,7 +63,78 @@ def get_service(service_type: ServiceType, default=None):
     try:
         return service_manager.get(service_type, default)
     except Exception:  # noqa: BLE001
+        # Preserve the traceback in logs so callers seeing a None return have something to grep
+        # for. Returning None remains the contract because several callers (e.g. get_db_service)
+        # treat absence as "not configured" and substitute a noop implementation.
+        logger.exception("Failed to resolve service %s", service_type)
         return None
+
+
+def get_model_provider_policy_service():
+    """Return the configured model-provider policy service or fail closed."""
+    from lfx.services.model_provider_policy.base import BaseModelProviderPolicyService
+    from lfx.services.model_provider_policy.service import ModelProviderPolicyService  # noqa: F401
+
+    service = get_service(ServiceType.MODEL_PROVIDER_POLICY_SERVICE)
+    if not isinstance(service, BaseModelProviderPolicyService) or not service.ready:
+        msg = "A valid, ready model_provider_policy_service is required"
+        raise TypeError(msg)
+    return service
+
+
+def get_policy_bundle_service() -> BasePolicyBundleService:
+    """Return the ready process-local shared policy bundle coordinator."""
+    from lfx.services.policy_bundle import BasePolicyBundleService, PolicyBundleService  # noqa: F401
+
+    service = get_service(ServiceType.POLICY_BUNDLE_SERVICE)
+    if not isinstance(service, BasePolicyBundleService) or not service.ready:
+        msg = "A valid, ready policy_bundle_service is required"
+        raise TypeError(msg)
+    return service
+
+
+_catalog_policy_fallback: BaseCatalogPolicyService | None = None
+_catalog_policy_fallback_lock = threading.Lock()
+
+
+def get_catalog_policy_service():
+    """Return the ready catalog-policy service.
+
+    Standalone LFX resolves the built-in allow-all implementation. Langflow
+    overrides it with the database-backed process-local snapshot service. A
+    broken configured implementation is replaced with one stable built-in
+    allow-all instance so later lookups remain fail-open instead of retrying a
+    failing constructor.
+    """
+    from lfx.services.catalog_policy.base import BaseCatalogPolicyService
+    from lfx.services.catalog_policy.service import CatalogPolicyService
+    from lfx.services.manager import get_service_manager
+
+    service_manager = get_service_manager()
+    cached = service_manager.services.get(ServiceType.CATALOG_POLICY_SERVICE)
+    if isinstance(cached, BaseCatalogPolicyService) and cached.ready:
+        return cached
+
+    service = get_service(ServiceType.CATALOG_POLICY_SERVICE)
+    if isinstance(service, BaseCatalogPolicyService) and service.ready:
+        return service
+
+    global _catalog_policy_fallback  # noqa: PLW0603
+    with _catalog_policy_fallback_lock:
+        cached = service_manager.services.get(ServiceType.CATALOG_POLICY_SERVICE)
+        if isinstance(cached, BaseCatalogPolicyService) and cached.ready:
+            return cached
+        fallback = _catalog_policy_fallback
+        if fallback is None:
+            fallback = CatalogPolicyService()
+            _catalog_policy_fallback = fallback
+        service_manager.services[ServiceType.CATALOG_POLICY_SERVICE] = fallback
+
+    logger.warning(
+        "Configured catalog_policy_service is unavailable or invalid; "
+        "using the built-in allow-all policy for this process"
+    )
+    return fallback
 
 
 def get_db_service() -> DatabaseServiceProtocol:
@@ -104,11 +182,34 @@ def get_shared_component_cache_service() -> CacheServiceProtocol | None:
     return get_service(ServiceType.SHARED_COMPONENT_CACHE_SERVICE, SharedComponentCacheServiceFactory())
 
 
+def get_extension_events_service():
+    """Retrieves the ExtensionEventsService instance.
+
+    Returns None if the service manager is not initialised (e.g. in unit-test
+    environments that don't boot the full service stack).  Callers must guard
+    against None and fall back to structured logging.
+    """
+    from lfx.services.extension_events.factory import ExtensionEventsServiceFactory
+
+    return get_service(ServiceType.EXTENSION_EVENTS_SERVICE, ExtensionEventsServiceFactory())
+
+
 def get_chat_service() -> ChatServiceProtocol | None:
     """Retrieves the chat service instance."""
     from lfx.services.schema import ServiceType
 
     return get_service(ServiceType.CHAT_SERVICE)
+
+
+def get_checkpoint_service():
+    """Checkpoint store: registered service, or the in-memory standalone fallback."""
+    from lfx.graph.checkpoint.store import default_checkpoint_store
+    from lfx.services.schema import ServiceType
+
+    service = get_service(ServiceType.CHECKPOINT_SERVICE)
+    if service is not None:
+        return service
+    return default_checkpoint_store()
 
 
 def get_tracing_service() -> TracingServiceProtocol | None:
@@ -127,6 +228,63 @@ def get_transaction_service() -> TransactionServiceProtocol | None:
     from lfx.services.schema import ServiceType
 
     return get_service(ServiceType.TRANSACTION_SERVICE)
+
+
+def get_auth_service() -> AuthServiceProtocol | None:
+    """Retrieves the auth service instance.
+
+    Returns the pluggable auth service (minimal LFX or full Langflow when configured).
+    """
+    from lfx.services.schema import ServiceType
+
+    return get_service(ServiceType.AUTH_SERVICE)
+
+
+def _get_deployment_registry() -> AdapterRegistry[DeploymentServiceProtocol]:
+    """Retrieve the deployment adapter registry singleton.
+
+    Discovery still needs to be triggered separately via
+    ``registry.discover(config_dir=...)``.
+    """
+    from lfx.services.adapters.registry import get_adapter_registry
+    from lfx.services.adapters.schema import AdapterType
+
+    return cast(
+        "AdapterRegistry[DeploymentServiceProtocol]",
+        get_adapter_registry(adapter_type=AdapterType.DEPLOYMENT),
+    )
+
+
+_deployment_discovery_lock = threading.Lock()
+
+
+def get_deployment_adapter(
+    adapter_key: str,
+) -> DeploymentServiceProtocol | None:
+    """Resolve a singleton deployment adapter instance by key.
+
+    Args:
+        adapter_key: Deployment adapter registry key (for example ``"local"``).
+    """
+    registry = _get_deployment_registry()
+    if not registry.is_discovered:
+        with _deployment_discovery_lock:
+            # Double-check after acquiring lock to avoid redundant discovery.
+            if not registry.is_discovered:
+                registry.discover(config_dir=_resolve_adapter_config_dir())
+    instance = registry.get_instance(adapter_key, factory=lambda adapter_class: adapter_class())
+    if instance is None:
+        logger.warning(
+            f"No deployment adapter found for key='{adapter_key}'. "
+            f"Available keys: {registry.list_keys()}. "
+            f"Check your lfx.toml or adapter registration."
+        )
+    return instance
+
+
+def _resolve_adapter_config_dir() -> Path:
+    """Resolve config directory for adapter discovery."""
+    return resolve_config_dir(None, settings_service=get_settings_service())
 
 
 async def get_session():
@@ -165,6 +323,8 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
             # not actual errors. Don't log them - FastAPI's exception handlers will
             # take care of the HTTP response. Just rollback any uncommitted changes.
             if session.is_active:
+                from sqlalchemy.exc import InvalidRequestError
+
                 with suppress(InvalidRequestError):
                     await session.rollback()
             raise
@@ -174,6 +334,8 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
 
             # Only rollback if session is still in a valid state
             if session.is_active:
+                from sqlalchemy.exc import InvalidRequestError
+
                 with suppress(InvalidRequestError):
                     # Session was already rolled back by SQLAlchemy
                     await session.rollback()

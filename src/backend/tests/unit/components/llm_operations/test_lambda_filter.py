@@ -101,6 +101,40 @@ class TestValidateLambda(TestLambdaFilterComponent):
         assert result is True
 
 
+class TestParseLambdaSandbox(TestLambdaFilterComponent):
+    """The LLM-generated lambda is untrusted (prompt-injection) and must be sandboxed."""
+
+    def test_benign_lambda_still_works(self, component_class):
+        component = component_class()
+        fn = component._parse_lambda_from_response("lambda x: x + 1")
+        assert fn(41) == 42
+
+    def test_benign_lambda_can_use_safe_builtins(self, component_class):
+        component = component_class()
+        fn = component._parse_lambda_from_response("lambda x: len(x)")
+        assert fn([1, 2, 3]) == 3
+
+    def test_dunder_escape_gadget_is_rejected_at_parse(self, component_class):
+        """Dunder attribute traversal is rejected up front by the AST safety check."""
+        component = component_class()
+        with pytest.raises(ValueError, match="unsafe lambda"):
+            component._parse_lambda_from_response("lambda x: x.__class__.__bases__")
+
+    def test_import_builtin_is_unreachable_at_call(self, component_class):
+        """`__import__` is a builtin Name, so the curated builtins make it raise NameError when called."""
+        component = component_class()
+        fn = component._parse_lambda_from_response("lambda x: __import__('os').system('id')")
+        with pytest.raises(NameError):
+            fn("ignored")
+
+    def test_open_builtin_is_unreachable(self, component_class):
+        """`open` is absent from the curated builtins, so the lambda raises NameError at call time."""
+        component = component_class()
+        fn = component._parse_lambda_from_response("lambda x: open('/etc/passwd')")
+        with pytest.raises(NameError):
+            fn("ignored")
+
+
 class TestGetDataStructure(TestLambdaFilterComponent):
     """Tests for get_data_structure method."""
 
@@ -563,13 +597,13 @@ class TestConvertResultToMessage(TestLambdaFilterComponent):
 class TestProcessAsDataIntegration(TestLambdaFilterComponent):
     """Integration tests for process_as_data method."""
 
-    @patch("lfx.base.models.unified_models.get_model_classes")
+    @patch("lfx.base.models.unified_models.get_model_class")
     async def test_should_return_filtered_data_when_lambda_is_valid(
-        self, mock_get_model_classes, component_class, default_kwargs, mock_llm
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
     ):
         # Arrange
         mock_model_class = MagicMock(return_value=mock_llm)
-        mock_get_model_classes.return_value = {"MockLanguageModel": mock_model_class}
+        mock_get_model_class.return_value = mock_model_class
         component = await self.component_setup(component_class, default_kwargs)
         mock_llm.ainvoke.return_value.content = "lambda x: [item for item in x['items'] if item['value'] > 15]"
 
@@ -584,13 +618,13 @@ class TestProcessAsDataIntegration(TestLambdaFilterComponent):
         assert filtered_items[0]["name"] == "test2"
         assert filtered_items[0]["value"] == 20
 
-    @patch("lfx.base.models.unified_models.get_model_classes")
+    @patch("lfx.base.models.unified_models.get_model_class")
     async def test_should_raise_error_when_lambda_not_found_in_response(
-        self, mock_get_model_classes, component_class, default_kwargs, mock_llm
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
     ):
         # Arrange
         mock_model_class = MagicMock(return_value=mock_llm)
-        mock_get_model_classes.return_value = {"MockLanguageModel": mock_model_class}
+        mock_get_model_class.return_value = mock_model_class
         component = await self.component_setup(component_class, default_kwargs)
         mock_llm.ainvoke.return_value.content = "invalid response without lambda"
 
@@ -614,13 +648,13 @@ class TestProcessAsMessageIntegration(TestLambdaFilterComponent):
             "max_size": 30000,
         }
 
-    @patch("lfx.base.models.unified_models.get_model_classes")
+    @patch("lfx.base.models.unified_models.get_model_class")
     async def test_should_transform_message_when_input_is_message(
-        self, mock_get_model_classes, component_class, message_kwargs, mock_llm
+        self, mock_get_model_class, component_class, message_kwargs, mock_llm
     ):
         # Arrange
         mock_model_class = MagicMock(return_value=mock_llm)
-        mock_get_model_classes.return_value = {"MockLanguageModel": mock_model_class}
+        mock_get_model_class.return_value = mock_model_class
         component = await self.component_setup(component_class, message_kwargs)
         mock_llm.ainvoke.return_value.content = "lambda text: text.upper()"
 
@@ -631,13 +665,13 @@ class TestProcessAsMessageIntegration(TestLambdaFilterComponent):
         assert isinstance(result, Message)
         assert result.text == "HELLO WORLD"
 
-    @patch("lfx.base.models.unified_models.get_model_classes")
+    @patch("lfx.base.models.unified_models.get_model_class")
     async def test_should_join_multiple_messages_when_input_is_list_of_messages(
-        self, mock_get_model_classes, component_class, model_metadata, mock_llm
+        self, mock_get_model_class, component_class, model_metadata, mock_llm
     ):
         # Arrange
         mock_model_class = MagicMock(return_value=mock_llm)
-        mock_get_model_classes.return_value = {"MockLanguageModel": mock_model_class}
+        mock_get_model_class.return_value = mock_model_class
         kwargs = {
             "data": [Message(text="Hello"), Message(text="World")],
             "model": model_metadata,
@@ -660,13 +694,13 @@ class TestProcessAsMessageIntegration(TestLambdaFilterComponent):
 class TestProcessAsDataframeIntegration(TestLambdaFilterComponent):
     """Integration tests for process_as_dataframe method."""
 
-    @patch("lfx.base.models.unified_models.get_model_classes")
+    @patch("lfx.base.models.unified_models.get_model_class")
     async def test_should_return_dataframe_when_lambda_returns_list_of_dicts(
-        self, mock_get_model_classes, component_class, default_kwargs, mock_llm
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
     ):
         # Arrange
         mock_model_class = MagicMock(return_value=mock_llm)
-        mock_get_model_classes.return_value = {"MockLanguageModel": mock_model_class}
+        mock_get_model_class.return_value = mock_model_class
         component = await self.component_setup(component_class, default_kwargs)
         mock_llm.ainvoke.return_value.content = "lambda x: x['items']"
 
@@ -680,13 +714,13 @@ class TestProcessAsDataframeIntegration(TestLambdaFilterComponent):
 class TestLargeDataset(TestLambdaFilterComponent):
     """Tests for handling large datasets."""
 
-    @patch("lfx.base.models.unified_models.get_model_classes")
+    @patch("lfx.base.models.unified_models.get_model_class")
     async def test_should_filter_large_dataset_when_data_exceeds_max_size(
-        self, mock_get_model_classes, component_class, default_kwargs, mock_llm
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
     ):
         # Arrange
         mock_model_class = MagicMock(return_value=mock_llm)
-        mock_get_model_classes.return_value = {"MockLanguageModel": mock_model_class}
+        mock_get_model_class.return_value = mock_model_class
         large_data = {"items": [{"name": f"test{i}", "value": i} for i in range(2000)]}
         default_kwargs["data"] = [Data(data=large_data)]
         default_kwargs["filter_instruction"] = "Filter items with value greater than 1500"
@@ -707,13 +741,13 @@ class TestLargeDataset(TestLambdaFilterComponent):
 class TestComplexDataStructure(TestLambdaFilterComponent):
     """Tests for handling complex nested data structures."""
 
-    @patch("lfx.base.models.unified_models.get_model_classes")
+    @patch("lfx.base.models.unified_models.get_model_class")
     async def test_should_handle_nested_data_when_structure_is_complex(
-        self, mock_get_model_classes, component_class, default_kwargs, mock_llm
+        self, mock_get_model_class, component_class, default_kwargs, mock_llm
     ):
         # Arrange
         mock_model_class = MagicMock(return_value=mock_llm)
-        mock_get_model_classes.return_value = {"MockLanguageModel": mock_model_class}
+        mock_get_model_class.return_value = mock_model_class
         complex_data = {
             "categories": {
                 "A": [{"id": 1, "score": 90}, {"id": 2, "score": 85}],

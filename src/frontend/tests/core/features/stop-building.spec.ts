@@ -1,13 +1,15 @@
-import { test } from "../../fixtures";
+import { expect, test } from "../../fixtures";
 import { addLegacyComponents } from "../../utils/add-legacy-components";
 import { adjustScreenView } from "../../utils/adjust-screen-view";
 import { awaitBootstrapTest } from "../../utils/await-bootstrap-test";
-
+import { TEXTS } from "../../utils/constants/texts";
+import { TIMEOUTS } from "../../utils/constants/timeouts";
+import { addComponentFromSidebar } from "../../utils/flow/add-component-from-sidebar";
+import { replaceComponentCode } from "../../utils/flow/replace-component-code";
 import { removeOldApiKeys } from "../../utils/remove-old-api-keys";
 import { updateOldComponents } from "../../utils/update-old-components";
 import { zoomOut } from "../../utils/zoom-out";
 
-// TODO: fix this test
 test(
   "user must be able to stop a building",
   { tag: ["@release", "@workspace", "@api"] },
@@ -19,59 +21,44 @@ test(
 
     //first component
 
-    await page.getByTestId("sidebar-search-input").click();
-    await page.getByTestId("sidebar-search-input").fill("text input");
-
-    await page
-      .getByTestId("input_outputText Input")
-      .dragTo(page.locator('//*[@id="react-flow-id"]'), {
-        targetPosition: { x: 50, y: 50 },
-      });
+    await addComponentFromSidebar(page, {
+      search: TEXTS.searchTextInput,
+      testId: "input_outputText Input",
+      position: { x: 50, y: 50 },
+    });
 
     await zoomOut(page, 3);
     //second component
 
-    await page.getByTestId("sidebar-search-input").click();
-    await page.getByTestId("sidebar-search-input").fill("url");
-
-    await page
-      .getByTestId("data_sourceURL")
-      .dragTo(page.locator('//*[@id="react-flow-id"]'), {
-        targetPosition: { x: 50, y: 300 },
-      });
+    await addComponentFromSidebar(page, {
+      search: TEXTS.searchUrl,
+      testId: "data_sourceURL",
+      position: { x: 50, y: 300 },
+    });
 
     //third component
 
-    await page.getByTestId("sidebar-search-input").click();
-    await page.getByTestId("sidebar-search-input").fill("split text");
-
-    await page
-      .getByTestId("processingSplit Text")
-      .dragTo(page.locator('//*[@id="react-flow-id"]'), {
-        targetPosition: { x: 300, y: 500 },
-      });
+    await addComponentFromSidebar(page, {
+      search: "split text",
+      testId: "processingSplit Text",
+      position: { x: 300, y: 500 },
+    });
 
     //fourth component
 
-    await page.getByTestId("sidebar-search-input").click();
-    await page.getByTestId("sidebar-search-input").fill("data to message");
-
-    await page
-      .getByTestId("processingData to Message")
-      .dragTo(page.locator('//*[@id="react-flow-id"]'), {
-        targetPosition: { x: 100, y: 500 },
-      });
+    await addComponentFromSidebar(page, {
+      search: "data to message",
+      testId: "processingData to Message",
+      position: { x: 100, y: 500 },
+    });
 
     //fifth component
 
-    await page.getByTestId("sidebar-search-input").click();
-    await page.getByTestId("sidebar-search-input").fill("chat output");
-
-    await page
-      .getByTestId("input_outputChat Output")
-      .dragTo(page.locator('//*[@id="react-flow-id"]'), {
-        targetPosition: { x: 600, y: 300 },
-      });
+    await addComponentFromSidebar(page, {
+      search: TEXTS.searchChatOutput,
+      testId: "input_outputChat Output",
+      position: { x: 600, y: 300 },
+    });
 
     await updateOldComponents(page);
     await removeOldApiKeys(page);
@@ -92,7 +79,7 @@ test(
 
     //connection 3
     await page.getByTestId("handle-splittext-shownode-chunks-right").click();
-    await page.getByTestId("handle-parsedata-shownode-data-left").click();
+    await page.getByTestId("handle-parsedata-shownode-json-left").click();
 
     //connection 4
     await page.getByTestId("handle-parsedata-shownode-message-right").click();
@@ -102,11 +89,17 @@ test(
 
     await adjustScreenView(page);
 
+    await page.getByText("Text Input", { exact: true }).click();
+
     await page.getByTestId("textarea_str_input_value").first().fill(",");
+
+    await page.getByText("URL", { exact: true }).click();
 
     await page
       .getByTestId("inputlist_str_urls_0")
       .fill("https://www.nature.com/articles/d41586-023-02870-5");
+
+    await page.getByText("Split Text", { exact: true }).click();
 
     await page.getByTestId("int_int_chunk_size").fill("2");
     await page.getByTestId("int_int_chunk_overlap").fill("1");
@@ -145,21 +138,22 @@ class CustomComponent(Component):
 
     await page.getByTestId("title-Custom Component").first().click();
 
-    await page.waitForSelector('[data-testid="code-button-modal"]', {
-      timeout: 3000,
-    });
-
-    await page.getByTestId("code-button-modal").click();
-
-    await page.waitForSelector('[id="checkAndSaveBtn"]', {
-      timeout: 3000,
-    });
-
-    await page.locator("textarea").last().press(`ControlOrMeta+a`);
-    await page.keyboard.press("Backspace");
-    await page.locator("textarea").last().fill(timerCode);
-    await page.locator('//*[@id="checkAndSaveBtn"]').click();
-    await page.waitForTimeout(500);
+    const componentFlowRefresh = page.waitForResponse(
+      (response) => {
+        const url = new URL(response.url());
+        return (
+          response.request().method() === "GET" &&
+          url.pathname === "/api/v1/flows/" &&
+          url.searchParams.get("components_only") === "true" &&
+          url.searchParams.get("get_all") === "true"
+        );
+      },
+      { timeout: TIMEOUTS.standard },
+    );
+    await replaceComponentCode(page, timerCode);
+    const refreshResponse = await componentFlowRefresh;
+    expect(refreshResponse.ok()).toBeTruthy();
+    expect(await refreshResponse.finished()).toBeNull();
 
     await page.getByTestId("button_run_custom component").click();
 

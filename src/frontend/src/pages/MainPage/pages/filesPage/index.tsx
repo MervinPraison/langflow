@@ -1,9 +1,14 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import ForwardedIconComponent from "@/components/common/genericIconComponent";
 import { SidebarTrigger } from "@/components/ui/sidebar";
+import { useDocumentTitle } from "@/hooks/use-document-title";
 import FilesTab from "./components/FilesTab";
 
 export const FilesPage = () => {
+  const { t } = useTranslation();
+  useDocumentTitle(t("files.pageTitle"));
+  // biome-ignore lint/suspicious/noExplicitAny: legacy
   const [selectedFiles, setSelectedFiles] = useState<any[]>([]);
   const [quantitySelected, setQuantitySelected] = useState(0);
   const [isShiftPressed, setIsShiftPressed] = useState(false);
@@ -50,7 +55,7 @@ export const FilesPage = () => {
         <div className="flex flex-1 flex-col justify-start px-5 pt-10">
           <div className="flex h-full flex-col justify-start">
             <div
-              className="flex items-center pb-8 text-xl font-semibold"
+              className="flex items-center pb-4 text-xl font-semibold"
               data-testid="mainpage_title"
             >
               <div className="h-7 w-10 transition-all group-data-[open=true]/sidebar-wrapper:md:w-0 lg:hidden">
@@ -64,7 +69,7 @@ export const FilesPage = () => {
                   </SidebarTrigger>
                 </div>
               </div>
-              Files
+              {t("files.pageTitle")}
             </div>
             <div className="flex h-full flex-col">
               <FilesTab {...tabProps} />

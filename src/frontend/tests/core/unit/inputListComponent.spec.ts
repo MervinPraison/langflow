@@ -1,6 +1,11 @@
 import { expect, test } from "../../fixtures";
 import { adjustScreenView } from "../../utils/adjust-screen-view";
 import { awaitBootstrapTest } from "../../utils/await-bootstrap-test";
+import { TEXTS } from "../../utils/constants/texts";
+import {
+  closeParametersPanel,
+  openParametersPanel,
+} from "../../utils/open-advanced-options";
 
 test(
   "InputListComponent",
@@ -10,7 +15,7 @@ test(
 
     await page.getByTestId("blank-flow").click();
     await page.getByTestId("sidebar-search-input").click();
-    await page.getByTestId("sidebar-search-input").fill("url");
+    await page.getByTestId("sidebar-search-input").fill(TEXTS.searchUrl);
 
     await page.waitForSelector('[data-testid="data_sourceURL"]', {
       timeout: 3000,
@@ -53,7 +58,10 @@ test(
       .fill("test2 test2 test2 test2");
 
     await page.getByTestId("div-generic-node").click();
-    await page.getByTestId("edit-button-modal").last().click();
+
+    // LE-1810: the panel only manages parameters — list values stay editable
+    // on the node itself.
+    await openParametersPanel(page);
 
     const value0 = await page.getByTestId("inputlist_str_urls_0").inputValue();
     const value1 = await page.getByTestId("inputlist_str_urls_1").inputValue();
@@ -68,19 +76,19 @@ test(
       expect(false).toBeTruthy();
     }
 
-    await page.getByTestId("input-list-delete-btn-edit_urls-0").click();
+    await closeParametersPanel(page);
 
-    expect(
-      await page.getByTestId("input-list-delete-btn-edit_urls-2").count(),
-    ).toBe(0);
+    await page.getByTestId("input-list-delete-btn_urls-0").click();
 
-    await page.getByTestId("input-list-delete-btn-edit_urls-1").click();
+    expect(await page.getByTestId("input-list-delete-btn_urls-2").count()).toBe(
+      0,
+    );
 
-    expect(
-      await page.getByTestId("input-list-delete-btn-edit_urls-1").count(),
-    ).toBe(0);
+    await page.getByTestId("input-list-delete-btn_urls-1").click();
 
-    await page.getByText("Close").last().click();
+    expect(await page.getByTestId("input-list-delete-btn_urls-1").count()).toBe(
+      0,
+    );
 
     await page.getByTestId("input-list-plus-btn_urls-0").click();
     await page.getByTestId("input-list-plus-btn_urls-0").click();
@@ -113,15 +121,5 @@ test(
     expect(await page.getByTestId("inputlist_str_urls_1").inputValue()).toBe(
       "",
     );
-
-    await page.getByTestId("edit-button-modal").click();
-
-    expect(
-      await page.getByTestId("inputlist_str_edit_urls_0").inputValue(),
-    ).toBe("test1 test1 test1 test1");
-
-    expect(
-      await page.getByTestId("inputlist_str_edit_urls_1").inputValue(),
-    ).toBe("");
   },
 );

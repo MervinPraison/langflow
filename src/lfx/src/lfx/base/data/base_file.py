@@ -1,6 +1,7 @@
 import ast
 import shutil
 import tarfile
+import threading
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
@@ -17,8 +18,15 @@ from lfx.io import BoolInput, FileInput, HandleInput, Output, StrInput
 from lfx.schema.data import Data
 from lfx.schema.dataframe import DataFrame
 from lfx.schema.message import Message
-from lfx.services.deps import get_settings_service
+from lfx.services.deps import get_settings_service, get_storage_service
 from lfx.utils.async_helpers import run_until_complete
+from lfx.utils.file_path_security import (
+    StorageNamespaceError,
+    component_authenticated_user_scope,
+    component_file_access_scopes,
+    enforce_local_file_access,
+    validate_storage_key,
+)
 from lfx.utils.helpers import build_content_type_from_extension
 
 if TYPE_CHECKING:
@@ -44,11 +52,13 @@ class BaseFileComponent(Component, ABC):
             path: Path,
             *,
             delete_after_processing: bool = False,
+            cleanup_local_file: bool = False,
             silent_errors: bool = False,
         ):
             self._data = data if isinstance(data, list) else [data]
             self.path = path
             self.delete_after_processing = delete_after_processing
+            self.cleanup_local_file = cleanup_local_file
             self._silent_errors = silent_errors
 
         @property
@@ -115,17 +125,31 @@ class BaseFileComponent(Component, ABC):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Dynamically update FileInput to include valid extensions and bundles
-        self.get_base_inputs()[0].file_types = [
+        # Eagerly create the per-instance lock used to serialize load_files_base.
+        # Lazy creation inside load_files_base would itself be racy on the very
+        # first concurrent entry — two threads could each create their own Lock
+        # and bypass serialization on the call this PR is meant to fix.
+        self._load_files_base_lock = threading.Lock()
+        file_types = [
             *self.valid_extensions,
             *self.SUPPORTED_BUNDLE_EXTENSIONS,
         ]
-
-        file_types = ", ".join(self.valid_extensions)
+        supported_file_types = ", ".join(self.valid_extensions)
         bundles = ", ".join(self.SUPPORTED_BUNDLE_EXTENSIONS)
-        self.get_base_inputs()[
-            0
-        ].info = f"Supported file extensions: {file_types}; optionally bundled in file extensions: {bundles}"
+        info = f"Supported file extensions: {supported_file_types}; optionally bundled in file extensions: {bundles}"
+        self._update_file_input_metadata(file_types=file_types, info=info)
+
+    def _update_file_input_metadata(self, *, file_types: list[str], info: str) -> None:
+        for input_ in self.inputs:
+            if isinstance(input_, FileInput) and input_.name == "path":
+                input_.file_types = file_types.copy()
+                input_.info = info
+                break
+
+        mapped_input = self._inputs.get("path")
+        if isinstance(mapped_input, FileInput):
+            mapped_input.file_types = file_types.copy()
+            mapped_input.info = info
 
     _base_inputs = [
         FileInput(
@@ -146,7 +170,7 @@ class BaseFileComponent(Component, ABC):
                 " or a Message object with a path to the file. Supercedes 'Path' but supports same file types."
             ),
             required=False,
-            input_types=["Data", "Message"],
+            input_types=["Data", "JSON", "Message"],
             is_list=True,
             advanced=True,
         ),
@@ -202,52 +226,175 @@ class BaseFileComponent(Component, ABC):
             list[BaseFile]: A list of BaseFile objects with updated `data`.
         """
 
+    def _load_files_paths_cache_key(self) -> tuple:
+        """Build a stable cache key for ``load_files_base`` from the current inputs.
+
+        The key includes both the local ``path`` input and any server file paths from
+        ``file_path``, plus the ``markdown`` flag (which can change which content
+        ``process_files`` produces). It is paths-keyed by design so different
+        component executions or input changes never reuse another call's cache.
+        """
+        path_value = getattr(self, "path", None)
+        if isinstance(path_value, list):
+            paths_part: tuple[str, ...] = tuple(str(p) for p in path_value)
+        elif path_value:
+            paths_part = (str(path_value),)
+        else:
+            paths_part = ()
+
+        file_path_part: tuple[str, ...] = ()
+        try:
+            server_data = self._file_path_as_list()
+        except (ValueError, AttributeError):
+            server_data = []
+        for d in server_data:
+            sp = d.data.get(self.SERVER_FILE_PATH_FIELDNAME) if isinstance(d.data, dict) else None
+            if sp:
+                file_path_part = (*file_path_part, str(sp))
+
+        markdown_flag = getattr(self, "markdown", False)
+        return (paths_part, file_path_part, markdown_flag)
+
     def load_files_base(self) -> list[Data]:
         """Loads and parses file(s), including unpacked file bundles.
+
+        Concurrent output methods on the same component instance are serialized so
+        that only one performs the actual file read/process/delete; the others see
+        the cached parsed result. This prevents both the spurious ``ValueError``
+        from a deleted server file and the silent data-loss interleaving where a
+        second caller would otherwise pass validation, then find the file gone in
+        ``_filter_and_mark_files`` and produce empty data.
 
         Returns:
             list[Data]: Parsed data from the processed files.
         """
-        self._temp_dirs: list[TemporaryDirectory] = []
-        final_files = []  # Initialize to avoid UnboundLocalError
-        try:
-            # Step 1: Validate the provided paths
-            files = self._validate_and_resolve_paths()
+        cache_key = self._load_files_paths_cache_key()
+        paths_subkey = cache_key[:-1]  # paths only, ignoring markdown flag
 
-            # Step 2: Handle bundles recursively
-            all_files = self._unpack_and_collect_files(files)
+        with self._load_files_base_lock:
+            cache: dict = getattr(self, "_load_files_base_processed_cache", None) or {}
 
-            # Step 3: Final validation of file types
-            final_files = self._filter_and_mark_files(all_files)
+            # Exact-key fast path: same inputs already processed once on this
+            # instance — return the cached parsed data and avoid reprocessing
+            # (and re-attempting to read a possibly-deleted server file).
+            if cache_key in cache:
+                return cache[cache_key]
 
-            # Step 4: Process files
-            processed_files = self.process_files(final_files)
+            self._temp_dirs: list[TemporaryDirectory] = []
+            self._validate_skipped_due_to_delete_race = False
+            final_files: list = []
+            try:
+                files = self._validate_and_resolve_paths()
 
-            # Extract and flatten Data objects to return
-            return [data for file in processed_files for data in file.data if file.data]
+                # Recovery path: validation skipped a missing server file marked
+                # ``delete_after_processing=True`` (i.e. a prior output call on
+                # this same instance already processed and deleted it). If we
+                # have any cached parsed result for the same source paths, reuse
+                # it so connected outputs see the same content instead of empty
+                # data. We accept that the cached entry may have been produced
+                # under a different ``markdown`` flag; preserving content is
+                # better than silently dropping it.
+                if self._validate_skipped_due_to_delete_race and not files and cache:
+                    for cached_key, cached_value in cache.items():
+                        if cached_key[:-1] == paths_subkey:
+                            self.log(
+                                "Server file already processed and deleted by a prior call "
+                                "on this component instance; reusing cached parsed data."
+                            )
+                            return cached_value
 
-        finally:
-            # Delete temporary directories
-            for temp_dir in self._temp_dirs:
-                temp_dir.cleanup()
-            # Delete files marked for deletion
-            for file in final_files:
-                if file.delete_after_processing and file.path.exists():
-                    if file.path.is_dir():
-                        shutil.rmtree(file.path)
-                    else:
-                        file.path.unlink()
+                all_files = self._unpack_and_collect_files(files)
+                final_files = self._filter_and_mark_files(all_files)
+                processed_files = self.process_files(final_files)
+                result = [data for file in processed_files for data in file.data if file.data]
+
+                # Only cache successful, non-empty results so a legitimate empty
+                # input on a later call cannot be misread as a race-recovery hit.
+                if result:
+                    cache[cache_key] = result
+                    self._load_files_base_processed_cache = cache
+
+                return result
+
+            finally:
+                # Delete temporary directories
+                for temp_dir in self._temp_dirs:
+                    temp_dir.cleanup()
+                # Delete files marked for deletion
+                for file in final_files:
+                    self._delete_after_processing(file)
+
+    def _delete_after_processing(self, file: BaseFile) -> None:
+        """Delete a processed server file through its configured storage backend."""
+        if not file.delete_after_processing:
+            return
+
+        if file.cleanup_local_file:
+            self._delete_local_path(file.path)
+            return
+
+        settings = get_settings_service().settings
+        if settings.storage_type == "s3":
+            parsed_path = parse_storage_path(str(file.path))
+            if not parsed_path:
+                # Absolute local paths can still be read in unrestricted S3 deployments
+                # for compatibility, but they must never be treated as object keys or
+                # deleted from the host filesystem.
+                return
+
+            namespace_id, file_name = parsed_path
+            if namespace_id != component_authenticated_user_scope(self):
+                # User-file and legacy flow-file objects share an untyped top-level
+                # namespace. Flow IDs are caller-selectable, so accepting a matching
+                # graph flow ID here could collide with another user's UUID. Only the
+                # authenticated user's namespace has unambiguous ownership.
+                self.log("Skipping S3 file cleanup outside the authenticated user's storage namespace.")
+                return
+
+            storage_service = get_storage_service()
+            if storage_service is None:
+                msg = "Storage service is unavailable; could not delete processed S3 file."
+                raise RuntimeError(msg)
+            run_until_complete(storage_service.delete_file(namespace_id, file_name))
+            return
+
+        self._delete_local_path(file.path)
+
+    @staticmethod
+    def _delete_local_path(path: Path) -> None:
+        """Delete an explicitly local cleanup target."""
+        if path.exists():
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
     def load_files_core(self) -> list[Data]:
-        """Load files and return as Data objects.
+        """Load files and return as Data objects, with per-instance caching.
+
+        Results are cached keyed by the ``markdown`` attribute so that multiple
+        output methods that share the same processing parameters (e.g.
+        ``load_files_message`` and ``load_files_dataframe`` when both run with
+        ``markdown=False``) do not trigger redundant file processing.
 
         Returns:
             list[Data]: List of Data objects from all files
         """
+        # Use the markdown flag (default False) as the cache key so that
+        # structured and markdown outputs are cached independently.
+        markdown_flag = getattr(self, "markdown", False)
+        cache_attr = f"_load_files_core_cache_{markdown_flag}"
+        cache_paths_attr = f"_load_files_core_paths_{markdown_flag}"
+
+        current_paths = tuple(getattr(self, "path", []) or [])
+        if hasattr(self, cache_attr) and getattr(self, cache_paths_attr, None) == current_paths:
+            return getattr(self, cache_attr)
+
         data_list = self.load_files_base()
-        if not data_list:
-            return [Data()]
-        return data_list
+        result = data_list if data_list else [Data()]
+        setattr(self, cache_attr, result)
+        setattr(self, cache_paths_attr, current_paths)
+        return result
 
     def _extract_file_metadata(self, data_item) -> dict:
         """Extract metadata from a data item with file_path."""
@@ -274,6 +421,7 @@ class BaseFileComponent(Component, ABC):
                 file_size = 0
 
         # Basic file metadata
+        metadata["file_path"] = file_path
         metadata["filename"] = filename
         metadata["file_size"] = file_size
 
@@ -417,9 +565,12 @@ class BaseFileComponent(Component, ABC):
             # TODO: Parse according to docling standards
             rows = [data_list[0].data]
 
-        self.status = DataFrame(rows)
+        result = DataFrame(rows)
+        if file_path:
+            result.attrs["source_file_path"] = str(file_path)
+        self.status = result
 
-        return DataFrame(rows)
+        return result
 
     def parse_string_to_dict(self, s: str) -> dict:
         # Try JSON first (handles true/false/null)
@@ -555,6 +706,7 @@ class BaseFileComponent(Component, ABC):
                     data=merged_data_list,
                     path=base_file.path,
                     delete_after_processing=base_file.delete_after_processing,
+                    cleanup_local_file=base_file.cleanup_local_file,
                 )
             )
 
@@ -612,8 +764,23 @@ class BaseFileComponent(Component, ABC):
             # that don't exist on the local filesystem. We defer validation until file processing.
             # For local storage, validate the file exists immediately to fail fast.
             if settings.storage_type == "s3":
+                resolved_path = Path(path_str)
+                if resolved_path.is_absolute():
+                    # S3 deployments intentionally support genuine absolute local files
+                    # for trusted internal callers. Preserve that read behavior while
+                    # applying restricted-mode confinement and never deleting the local
+                    # path through the Server File cleanup flag.
+                    resolved_path = enforce_local_file_access(
+                        resolved_path, scope_ids=component_file_access_scopes(self)
+                    )
+                    delete_after_processing = False
+                elif parse_storage_path(path_str):
+                    # Relative values are object keys ("<namespace>/<file_name>") handed to
+                    # ``storage_service.get_file`` at read time. The namespace selects another
+                    # principal's prefix, so it must belong to this graph.
+                    validate_storage_key(self, path_str)
                 resolved_files.append(
-                    BaseFileComponent.BaseFile(data, Path(path_str), delete_after_processing=delete_after_processing)
+                    BaseFileComponent.BaseFile(data, resolved_path, delete_after_processing=delete_after_processing)
                 )
             else:
                 # Check if path looks like a storage path (flow_id/filename format)
@@ -622,6 +789,10 @@ class BaseFileComponent(Component, ABC):
                     try:
                         resolved_path = Path(self.get_full_path(path_str))
                         self.log(f"Resolved storage path '{path_str}' to '{resolved_path}'")
+                    except StorageNamespaceError:
+                        # An out-of-scope namespace is an access denial, not a resolution
+                        # failure: never fall back to reading the raw string as a local path.
+                        raise
                     except (ValueError, AttributeError) as e:
                         # Fallback to resolve_path if get_full_path fails
                         self.log(f"get_full_path failed for '{path_str}': {e}, falling back to resolve_path")
@@ -629,7 +800,21 @@ class BaseFileComponent(Component, ABC):
                 else:
                     resolved_path = Path(self.resolve_path(path_str))
 
+                # Security: in restricted (multi-tenant) mode, confine reads to the storage dir
+                # so a tenant cannot read arbitrary server files via an absolute/traversal path.
+                resolved_path = enforce_local_file_access(resolved_path, scope_ids=component_file_access_scopes(self))
+
                 if not resolved_path.exists():
+                    if delete_after_processing:
+                        # File may have already been processed and deleted by a concurrent output call.
+                        # Flag the skip so ``load_files_base`` can recover from any cached
+                        # parsed result for these paths instead of returning empty data.
+                        self._validate_skipped_due_to_delete_race = True
+                        self.log(
+                            f"Server file '{path}' not found - skipping as it may have been "
+                            "already processed and deleted by a concurrent call."
+                        )
+                        return
                     msg = f"File not found: '{path}' (resolved to: '{resolved_path}'). Please upload the file again."
                     self.log(msg)
                     if not self.silent_errors:
@@ -686,16 +871,20 @@ class BaseFileComponent(Component, ABC):
             data = file.data
 
             if path.is_dir():
-                # Recurse into directories
+                # Recurse into directories. Skip symlinks defensively so that a
+                # link planted in a previously-extracted bundle (or a directory
+                # the user pointed at) cannot be dereferenced into an arbitrary
+                # host file (GHSA-ccv6-r384-xp75).
                 collected_files.extend(
                     [
                         BaseFileComponent.BaseFile(
                             data,
                             sub_path,
                             delete_after_processing=delete_after_processing,
+                            cleanup_local_file=file.cleanup_local_file,
                         )
                         for sub_path in path.rglob("*")
-                        if sub_path.is_file()
+                        if sub_path.is_file() and not sub_path.is_symlink()
                     ]
                 )
             elif path.suffix[1:] in self.SUPPORTED_BUNDLE_EXTENSIONS:
@@ -704,7 +893,11 @@ class BaseFileComponent(Component, ABC):
                 self._temp_dirs.append(temp_dir)
                 temp_dir_path = Path(temp_dir.name)
                 self._unpack_bundle(path, temp_dir_path)
-                subpaths = list(temp_dir_path.iterdir())
+                # Drop any symlink that may have slipped through extraction.
+                # `_unpack_bundle` rejects link members for TAR archives, but
+                # this guard keeps the contract in place for any future bundle
+                # type added to SUPPORTED_BUNDLE_EXTENSIONS.
+                subpaths = [p for p in temp_dir_path.iterdir() if not p.is_symlink()]
                 self.log(f"Unpacked bundle {path.name} into {subpaths}")
                 collected_files.extend(
                     [
@@ -712,6 +905,7 @@ class BaseFileComponent(Component, ABC):
                             data,
                             sub_path,
                             delete_after_processing=delete_after_processing,
+                            cleanup_local_file=file.cleanup_local_file,
                         )
                         for sub_path in subpaths
                     ]
@@ -752,11 +946,24 @@ class BaseFileComponent(Component, ABC):
                 bundle.extract(member, path=output_dir)
 
         def _safe_extract_tar(bundle: tarfile.TarFile, output_dir: Path):
-            """Safely extract TAR files."""
+            """Safely extract TAR files.
+
+            Only regular files and directories are extracted. Symlinks, hardlinks,
+            and device/FIFO members are rejected because they could be made to
+            point at arbitrary locations on the host filesystem and lead to
+            arbitrary file read once the extracted entries are subsequently
+            ingested by `process_files()` (GHSA-ccv6-r384-xp75).
+            """
             for member in bundle.getmembers():
                 # Filter out resource fork information for automatic production of mac
                 if Path(member.name).name.startswith("._"):
                     continue
+                if member.issym() or member.islnk():
+                    msg = f"Refusing to extract link member from TAR File: {member.name!r} -> {member.linkname!r}"
+                    raise ValueError(msg)
+                if not (member.isfile() or member.isdir()):
+                    msg = f"Refusing to extract non-regular TAR member: {member.name!r}"
+                    raise ValueError(msg)
                 member_path = output_dir / member.name
                 # Ensure no path traversal outside `output_dir`
                 if not member_path.resolve().is_relative_to(output_dir.resolve()):

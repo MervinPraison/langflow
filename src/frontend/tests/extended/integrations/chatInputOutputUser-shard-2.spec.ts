@@ -1,31 +1,32 @@
-import * as dotenv from "dotenv";
-import path from "path";
 import { expect, test } from "../../fixtures";
 import { awaitBootstrapTest } from "../../utils/await-bootstrap-test";
-import { initialGPTsetup } from "../../utils/initialGPTsetup";
+import { configureLoopbackOpenAI } from "../../utils/configure-loopback-openai";
+import { TEXTS } from "../../utils/constants/texts";
+import {
+  closeParametersPanel,
+  openParametersPanel,
+  toggleParameterOnNode,
+} from "../../utils/open-advanced-options";
+import { seedLoopbackProvider } from "../../utils/seed-loopback-provider";
 
 test(
   "user must interact with chat with Input/Output",
   { tag: ["@release", "@components"] },
   async ({ page }) => {
-    test.skip(
-      !process?.env?.OPENAI_API_KEY,
-      "OPENAI_API_KEY required to run this test",
-    );
-
-    if (!process.env.CI) {
-      dotenv.config({ path: path.resolve(__dirname, "../../.env") });
-    }
-
+    await seedLoopbackProvider(page);
     await awaitBootstrapTest(page);
 
     await page.getByTestId("side_nav_options_all-templates").click();
-    await page.getByRole("heading", { name: "Basic Prompting" }).click();
+    await page
+      .getByRole("heading", { name: TEXTS.templateBasicPrompting })
+      .click();
 
-    await initialGPTsetup(page);
+    await configureLoopbackOpenAI(page);
 
     // Open Playground
-    await page.getByRole("button", { name: "Playground", exact: true }).click();
+    await page
+      .getByRole("button", { name: TEXTS.playground, exact: true })
+      .click();
 
     await page.waitForSelector('[data-testid="input-chat-playground"]', {
       timeout: 100000,
@@ -57,18 +58,18 @@ test(
       page.locator('[data-testid^="chat-message-AI"]').first(),
     ).not.toBeEmpty();
 
-    // close the playground
-    await page.getByRole("button", { name: "Playground", exact: true }).click();
+    // close the playground (fullscreen covers the toolbar, use the close button)
+    await page.getByTestId("playground-close-button").click();
 
-    await page.getByText("Chat Input", { exact: true }).click();
-    await page.getByTestId("edit-button-modal").click();
-    await page.getByTestId("showsender_name").click();
-    await page.getByText("Close").last().click();
+    await page.getByRole("application", { name: "Chat Input node" }).click();
+    await openParametersPanel(page);
+    await toggleParameterOnNode(page, "sender_name");
+    await closeParametersPanel(page);
 
-    await page.getByText("Chat Output", { exact: true }).click();
-    await page.getByTestId("edit-button-modal").click();
-    await page.getByTestId("showsender_name").click();
-    await page.getByText("Close").last().click();
+    await page.getByRole("application", { name: "Chat Output node" }).click();
+    await openParametersPanel(page);
+    await toggleParameterOnNode(page, "sender_name");
+    await closeParametersPanel(page);
 
     await page
       .getByTestId("popover-anchor-input-sender_name")
@@ -79,7 +80,9 @@ test(
       .nth(1)
       .fill("TestSenderNameAI");
 
-    await page.getByRole("button", { name: "Playground", exact: true }).click();
+    await page
+      .getByRole("button", { name: TEXTS.playground, exact: true })
+      .click();
 
     await page.waitForSelector('[data-testid="button-send"]', {
       timeout: 100000,
@@ -106,5 +109,7 @@ test(
     await expect(
       page.locator('[data-testid^="chat-message-TestSenderNameAI"]').first(),
     ).not.toBeEmpty();
+
+    await page.getByTestId("playground-close-button").click();
   },
 );

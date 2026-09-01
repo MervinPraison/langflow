@@ -3,6 +3,7 @@ import { BASE_URL_API_V2 } from "../../../constants/constants";
 
 export const URLs = {
   TRANSACTIONS: `monitor/transactions`,
+  TRACES: `monitor/traces`,
   API_KEY: `api_key`,
   FILES: `files`,
   FILE_MANAGEMENT: `files`,
@@ -31,19 +32,30 @@ export const URLs = {
   PUBLIC_FLOW: `flows/public_flow`,
   MCP: `mcp/project`,
   MCP_SERVERS: `mcp/servers`,
+  A2A: `a2a`,
   KNOWLEDGE_BASES: `knowledge_bases`,
+  MEMORIES: `memories`,
   MODELS: `models`,
   MODEL_PROVIDERS: `models/providers`,
   RUN: `run`,
   RUN_SESSION: `run/session`,
   REGISTRATION: `registration`,
+  DEPLOYMENTS: `deployments`,
+  DEPLOYMENT_PROVIDER_ACCOUNTS: `deployments/providers`,
+  AGENTIC_ASSIST: `agentic/assist`,
+  AGENTIC_ASSIST_STREAM: `agentic/assist/stream`,
+  AGENTIC_CHECK_CONFIG: `agentic/check-config`,
+  AGENTIC_FILES: `agentic/files`,
+  POLICY_BUNDLE: `policy-bundle`,
+  EXTENSIONS: `extensions`,
+  AUTHZ_ME_PERMISSIONS: `authz/me/permissions`,
 } as const;
 
 // IMPORTANT: FOLDERS endpoint now points to 'projects' for backward compatibility
 
 export function getURL(
   key: keyof typeof URLs,
-  params: any = {},
+  params: Record<string, unknown> = {},
   v2: boolean = false,
 ) {
   let url = URLs[key];

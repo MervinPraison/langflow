@@ -15,6 +15,10 @@ class NoopSession:
 
     bind = NoopBind()
 
+    async def connection(self):
+        """Return a no-op async connection for session-level database probes."""
+        return self.NoopBind.NoopConnect()
+
     async def add(self, *args, **kwargs):
         pass
 
@@ -58,5 +62,8 @@ class NoopSession:
 
             def one_or_none(self):
                 return None
+
+            def __iter__(self):
+                return iter([])
 
         return _NoopResult()

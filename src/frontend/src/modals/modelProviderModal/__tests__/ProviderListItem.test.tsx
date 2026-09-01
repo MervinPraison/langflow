@@ -102,6 +102,7 @@ describe("ProviderListItem", () => {
 
       const item = screen.getByTestId("provider-item-OpenAI");
       expect(item).toHaveClass("bg-muted/50");
+      expect(item).toHaveAttribute("aria-pressed", "true");
     });
 
     it("should call onSelect when clicked", async () => {
@@ -110,8 +111,22 @@ describe("ProviderListItem", () => {
 
       render(<ProviderListItem {...defaultProps} onSelect={onSelect} />);
 
-      const item = screen.getByTestId("provider-item-OpenAI");
+      const item = screen.getByRole("button", { name: /OpenAI/i });
       await user.click(item);
+
+      expect(onSelect).toHaveBeenCalledWith(mockEnabledProvider);
+    });
+
+    it("should be keyboard focusable and activatable with Enter", async () => {
+      const onSelect = jest.fn();
+      const user = userEvent.setup();
+
+      render(<ProviderListItem {...defaultProps} onSelect={onSelect} />);
+
+      const item = screen.getByRole("button", { name: /OpenAI/i });
+      item.focus();
+      expect(item).toHaveFocus();
+      await user.keyboard("{Enter}");
 
       expect(onSelect).toHaveBeenCalledWith(mockEnabledProvider);
     });
@@ -148,13 +163,13 @@ describe("ProviderListItem", () => {
       expect(item).toHaveClass("cursor-pointer");
     });
 
-    it("should have not-allowed cursor for provider without models", () => {
+    it("should still have pointer cursor for provider without models since all are clickable", () => {
       render(
         <ProviderListItem {...defaultProps} provider={mockProviderNoModels} />,
       );
 
       const item = screen.getByTestId("provider-item-Empty");
-      expect(item).toHaveClass("cursor-not-allowed");
+      expect(item).toHaveClass("cursor-pointer");
     });
   });
 });

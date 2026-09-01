@@ -14,13 +14,22 @@ export default function DictComponent({
   editNode = false,
   id = "",
   name = "",
-}: InputProps<object | object[] | string, { name: string }>): JSX.Element {
+  showParameter = true,
+  ariaLabelledBy,
+}: InputProps<
+  object | object[] | string,
+  { name: string }
+>): JSX.Element | null {
   useEffect(() => {
     if (disabled || value === null) {
       handleOnNewValue({ value: {} }, { skipSnapshot: true });
     }
   }, [disabled]);
   const placeholderName = `Edit ${toTitleCase(name)}`;
+
+  if (!showParameter) {
+    return null;
+  }
 
   return (
     <div
@@ -46,6 +55,7 @@ export default function DictComponent({
                 editNode ? "h-fit px-3 py-0.5" : "",
               )}
               data-testid={editNode ? `edit_${id}` : `${id}`}
+              aria-labelledby={ariaLabelledBy}
             >
               <ForwardedIconComponent
                 strokeWidth={ICON_STROKE_WIDTH}

@@ -1,6 +1,6 @@
 import { memo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ForwardedIconComponent } from "@/components/common/genericIconComponent";
-import { EMPTY_INPUT_SEND_MESSAGE } from "@/constants/constants";
 import { useUpdateMessage } from "@/controllers/API/queries/messages";
 import { CustomProfileIcon } from "@/customization/components/custom-profile-icon";
 import useAlertStore from "@/stores/alertStore";
@@ -14,6 +14,7 @@ import { EditMessageButton } from "./message-options";
 
 export const UserMessage = memo(
   ({ chat, lastMessage, updateChat, playgroundPage }: chatMessagePropsType) => {
+    const { t } = useTranslation();
     const setErrorData = useAlertStore((state) => state.setErrorData);
     const [editMessage, setEditMessage] = useState(false);
     const flow_id = useFlowsManagerStore((state) => state.currentFlowId);
@@ -53,7 +54,7 @@ export const UserMessage = memo(
           },
           onError: () => {
             setErrorData({
-              title: "Error updating messages.",
+              title: t("errors.updatingMessages"),
             });
           },
         },
@@ -72,8 +73,14 @@ export const UserMessage = memo(
             flow_id,
             session_id: chat.session ?? "",
             properties: {
-              ...chat.properties,
               positive_feedback: evaluation,
+              ...(chat.properties?.state === "partial" ||
+              chat.properties?.state === "complete"
+                ? { state: chat.properties.state }
+                : {}),
+              ...(chat.properties?.source
+                ? { source: { id: chat.properties.source.id } }
+                : {}),
             },
           },
           refetch: true,
@@ -81,7 +88,7 @@ export const UserMessage = memo(
         {
           onError: () => {
             setErrorData({
-              title: "Error updating messages.",
+              title: t("errors.updatingMessages"),
             });
           },
         },
@@ -89,7 +96,9 @@ export const UserMessage = memo(
     };
 
     const editedFlag = chat.edit ? (
-      <div className="text-sm text-muted-foreground">(Edited)</div>
+      <div className="mt-2 text-xs text-muted-foreground text-right">
+        (Edited)
+      </div>
     ) : null;
 
     const isEmoji = chat.properties?.icon?.match(
@@ -101,7 +110,7 @@ export const UserMessage = memo(
         <div className="w-full py-4 word-break-break-word">
           <div
             className={cn(
-              "group relative flex w-full gap-4 rounded-md p-2 bg-muted @[45rem]/chat-panel:bg-transparent @[45rem]/chat-panel:p-2",
+              "group relative flex w-full gap-4 rounded-md px-2 py-3 bg-muted @[45rem]/chat-panel:bg-transparent @[45rem]/chat-panel:px-2 @[45rem]/chat-panel:py-3",
               editMessage ? "" : "hover:bg-muted",
             )}
           >
@@ -131,6 +140,9 @@ export const UserMessage = memo(
 
             {/* Content */}
             <div className="flex w-[94%] flex-col gap-2">
+              <span className="text-sm font-medium text-foreground">
+                {chat.sender_name ?? "User"}
+              </span>
               <div className="form-modal-chat-text-position flex-grow">
                 <div className="flex w-full flex-col">
                   {editMessage ? (
@@ -151,19 +163,19 @@ export const UserMessage = memo(
                           )}
                           data-testid={`chat-message-${chat.sender_name}-${chatMessage}`}
                         >
-                          {isEmpty ? EMPTY_INPUT_SEND_MESSAGE : decodedMessage}
+                          {isEmpty ? t("input.noInputMessage") : decodedMessage}
                           {editedFlag}
                         </div>
                       )}
                     </>
                   )}
                   {chat.files && chat.files.length > 0 && (
-                    <div className="mt-2 flex w-full items-center gap-4 overflow-auto">
+                    <div className="mt-2 flex w-full items-start gap-4 overflow-auto">
                       {chat.files.map((file, index) => (
                         <FilePreviewDisplay
                           key={index}
                           file={file}
-                          variant="compact"
+                          variant="expanded"
                           showDelete={false}
                         />
                       ))}
@@ -175,11 +187,11 @@ export const UserMessage = memo(
 
             {/* Actions */}
             {!editMessage && (
-              <div className="invisible absolute -top-4 right-0 group-hover:visible">
+              <div className="pointer-events-none absolute -top-4 right-0 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
                 <EditMessageButton
                   onCopy={() => navigator.clipboard.writeText(chatMessage)}
                   onEdit={() => setEditMessage(true)}
-                  className="h-fit group-hover:visible"
+                  className="h-fit"
                   isBotMessage={false}
                   onEvaluate={handleEvaluateAnswer}
                   evaluation={chat.properties?.positive_feedback}

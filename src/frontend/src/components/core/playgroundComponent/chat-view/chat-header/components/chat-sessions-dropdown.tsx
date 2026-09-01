@@ -1,4 +1,5 @@
-import React, { useState } from "react";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import ForwardedIconComponent from "@/components/common/genericIconComponent";
 import { Button } from "@/components/ui/button";
 import {
@@ -29,6 +30,7 @@ export function ChatSessionsDropdown({
   open: controlledOpen,
   onOpenChange: controlledOnOpenChange,
 }: ChatSessionsDropdownProps) {
+  const { t } = useTranslation();
   const currentFlowId = useGetFlowId();
   const hasSessions: boolean = sessions.length > 0;
   const [internalOpen, setInternalOpen] = useState(false);
@@ -44,57 +46,63 @@ export function ChatSessionsDropdown({
           variant="ghost"
           size="icon"
           className="h-8 w-8 rounded"
-          aria-label="Chat sessions"
+          aria-label={t("playgroundComponent.chatSessions")}
           data-testid="session-selector-trigger"
         >
           <ForwardedIconComponent name="ListRestart" className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-56">
+      <DropdownMenuContent align="start" className="w-56 p-0">
         {hasSessions ? (
           <>
-            <DropdownMenuGroup>
-              {sessions.map((session) => (
+            <div className="max-h-[320px] overflow-y-auto p-1">
+              <DropdownMenuGroup>
+                {sessions.map((session) => (
+                  <DropdownMenuItem
+                    key={session}
+                    className={cn(
+                      "gap-2 text-sm",
+                      currentSessionId === session && "font-semibold bg-accent",
+                    )}
+                    onSelect={() => {
+                      onSessionSelect?.(session);
+                      setOpen(false);
+                    }}
+                  >
+                    {session === currentFlowId ? "Default Session" : session}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuGroup>
+            </div>
+            <DropdownMenuSeparator className="!my-0" />
+            <div className="p-1">
+              <DropdownMenuGroup>
                 <DropdownMenuItem
-                  key={session}
-                  className={cn(
-                    "gap-2 text-sm",
-                    currentSessionId === session && "font-semibold bg-accent",
-                  )}
+                  className="gap-2 text-sm"
                   onSelect={() => {
-                    onSessionSelect?.(session);
+                    onNewChat?.();
                     setOpen(false);
                   }}
                 >
-                  {session === currentFlowId ? "Default Session" : session}
+                  <ForwardedIconComponent name="Plus" className="h-4 w-4" />
+                  New Session
                 </DropdownMenuItem>
-              ))}
-            </DropdownMenuGroup>
-            <DropdownMenuSeparator className="!my-0" />
-            <DropdownMenuGroup>
-              <DropdownMenuItem
-                className="gap-2 text-sm"
-                onSelect={() => {
-                  onNewChat?.();
-                  setOpen(false);
-                }}
-              >
-                <ForwardedIconComponent name="Plus" className="h-4 w-4" />
-                New Session
-              </DropdownMenuItem>
-            </DropdownMenuGroup>
+              </DropdownMenuGroup>
+            </div>
           </>
         ) : (
-          <DropdownMenuItem
-            className="gap-2 text-sm"
-            onSelect={() => {
-              onNewChat?.();
-              setOpen(false);
-            }}
-          >
-            <ForwardedIconComponent name="Plus" className="h-4 w-4" />
-            New Session
-          </DropdownMenuItem>
+          <div className="p-1">
+            <DropdownMenuItem
+              className="gap-2 text-sm"
+              onSelect={() => {
+                onNewChat?.();
+                setOpen(false);
+              }}
+            >
+              <ForwardedIconComponent name="Plus" className="h-4 w-4" />
+              New Session
+            </DropdownMenuItem>
+          </div>
         )}
       </DropdownMenuContent>
     </DropdownMenu>

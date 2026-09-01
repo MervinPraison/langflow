@@ -1,5 +1,6 @@
+import { isEqual } from "lodash";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { ReactSortable } from "react-sortablejs";
+import { type ItemInterface, ReactSortable } from "react-sortablejs";
 import ListSelectionComponent from "@/CustomNodes/GenericNode/components/ListSelectionComponent";
 import ForwardedIconComponent from "@/components/common/genericIconComponent";
 import { Button } from "@/components/ui/button";
@@ -7,12 +8,19 @@ import { cn } from "@/utils/utils";
 import type { InputProps } from "../../types";
 import HelperTextComponent from "../helperTextComponent";
 
+export type SortableListItemType = {
+  name: string;
+  chosen?: boolean;
+  selected?: boolean;
+  [key: string]: unknown;
+};
+
 type SortableListComponentProps = {
   tooltip?: string;
   name?: string;
   helperText?: string;
-  helperMetadata?: any;
-  options?: any[];
+  helperMetadata?: { icon: string | undefined; variant: string };
+  options?: SortableListItemType[];
   searchCategory?: string[];
   icon?: string;
   limit?: number;
@@ -25,7 +33,7 @@ const SortableListItem = memo(
     onRemove,
     limit = 1,
   }: {
-    data: any;
+    data: SortableListItemType;
     index: number;
     onRemove: () => void;
     limit?: number;
@@ -86,9 +94,11 @@ const SortableListComponent = ({
   searchCategory = [],
   limit,
   id,
+  showParameter = true,
   ...baseInputProps
-}: InputProps<any, SortableListComponentProps>) => {
-  const { placeholder, handleOnNewValue, value } = baseInputProps;
+}: InputProps<SortableListItemType[], SortableListComponentProps>) => {
+  const { placeholder, handleOnNewValue, value, ariaLabelledBy } =
+    baseInputProps;
   const [open, setOpen] = useState(false);
 
   // Convert value to an array if it exists, otherwise use empty array
@@ -103,10 +113,22 @@ const SortableListComponent = ({
   );
 
   const setListDataHandler = useCallback(
-    (newList: any[]) => {
-      handleOnNewValue({ value: newList });
+    (newList: SortableListItemType[]) => {
+      const sanitizedNewList = newList.map((item) => {
+        const { chosen, selected, ...rest } = item;
+        return rest;
+      });
+
+      const sanitizedListData = listData.map((item) => {
+        const { chosen, selected, ...rest } = item;
+        return rest;
+      });
+
+      if (!isEqual(sanitizedNewList, sanitizedListData)) {
+        handleOnNewValue({ value: sanitizedNewList });
+      }
     },
-    [handleOnNewValue],
+    [listData, handleOnNewValue],
   );
 
   const handleCloseListSelectionDialog = useCallback(() => {
@@ -132,6 +154,10 @@ const SortableListComponent = ({
     }
   }, [helperText, open]);
 
+  if (!showParameter) {
+    return null;
+  }
+
   return (
     <div className="flex w-full flex-col">
       <div className="flex w-full flex-row gap-2">
@@ -145,6 +171,8 @@ const SortableListComponent = ({
               "dropdown-component-outline input-edit-node w-full",
               editNode ? "py-1" : "py-2",
             )}
+            aria-labelledby={ariaLabelledBy}
+            aria-expanded={open}
             data-testid={
               id
                 ? `button_open_list_selection_${id}`
@@ -166,8 +194,14 @@ const SortableListComponent = ({
       {listData.length > 0 && (
         <div className="flex w-full flex-col">
           <ReactSortable
-            list={listData}
-            setList={setListDataHandler}
+            // react-sortablejs's ItemInterface requires an `id` field that
+            // these list items (real shape: { name, ...rest }) never carry;
+            // cast only at this third-party boundary rather than widening
+            // our own types back to `any`.
+            list={listData as unknown as ItemInterface[]}
+            setList={(newList) =>
+              setListDataHandler(newList as unknown as SortableListItemType[])
+            }
             className={"flex w-full flex-col"}
           >
             {listData.map((data, index) => (
@@ -201,6 +235,7 @@ const SortableListComponent = ({
         selectedList={listData}
         options={options}
         limit={limit}
+        id={id}
         {...baseInputProps}
       />
     </div>

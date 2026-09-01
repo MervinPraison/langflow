@@ -1,5 +1,4 @@
-from langchain.docstore.document import Document
-from langchain_experimental.text_splitter import SemanticChunker
+from langchain_core.documents import Document
 
 from lfx.base.textsplitters.model import LCTextSplitterComponent
 from lfx.io import (
@@ -28,7 +27,7 @@ class SemanticTextSplitterComponent(LCTextSplitterComponent):
             name="data_inputs",
             display_name="Data Inputs",
             info="List of Data objects containing text and metadata to split.",
-            input_types=["Data"],
+            input_types=["Data", "JSON"],
             is_list=True,
             required=True,
         ),
@@ -123,6 +122,8 @@ class SemanticTextSplitterComponent(LCTextSplitterComponent):
 
             if self.sentence_split_regex:
                 splitter_params["sentence_split_regex"] = self.sentence_split_regex
+
+            from langchain_experimental.text_splitter import SemanticChunker
 
             splitter = SemanticChunker(**splitter_params)
             docs = splitter.create_documents(texts, metadatas=metadatas)

@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator, Iterator
 from typing import Any, TypeAlias, get_args
 
 from pandas import DataFrame
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 
 from lfx.inputs.validators import CoalesceBool
 from lfx.schema.data import Data
@@ -35,13 +35,34 @@ from .input_mixin import (
 )
 
 
+def _reject_secret_in_non_password_field(v: Any, info) -> None:
+    """Reject Credential-typed global variables in non-secret fields with a clear message.
+
+    Variable-driven wrapping in VariableService.get_variable returns SecretStr for CREDENTIAL
+    variables. Routing one into a non-password input would leak the value through Message.text,
+    status, traces, etc., so we fail at validation with an actionable error.
+    """
+    if isinstance(v, SecretStr) and not info.data.get("password"):
+        input_name = info.data.get("name", "<unknown>")
+        msg = (
+            f"Cannot use a Credential-typed global variable in '{input_name}'. "
+            "Credential variables are only allowed in secret fields (API keys, tokens, etc.) "
+            "to prevent the value from being exposed in component outputs, logs, or traces. "
+            "Either select a Generic-typed variable, or change this variable's type to Generic "
+            "if it is not actually sensitive."
+        )
+        raise ValueError(msg)
+
+
 class TableInput(BaseInputMixin, MetadataTraceMixin, TableMixin, ListableInputMixin, ToolModeMixin):
     field_type: SerializableFieldTypes = FieldTypes.TABLE
     is_list: bool = True
+    input_types: list[str] = ["DataFrame", "Table"]
 
     @field_validator("value")
     @classmethod
-    def validate_value(cls, v: Any, _info):
+    def validate_value(cls, v: Any, info):
+        _reject_secret_in_non_password_field(v, info)
         # Convert single dict or Data instance into a list.
         if isinstance(v, dict | Data):
             v = [v]
@@ -73,6 +94,35 @@ class TableInput(BaseInputMixin, MetadataTraceMixin, TableMixin, ListableInputMi
         return v
 
 
+class DataDisplayInput(BaseInputMixin):
+    """A read-only display field: a node button that opens a modal showing structured, dynamic data.
+
+    The component supplies a structured payload as ``value`` (refresh it via ``real_time_refresh``).
+    All keys are optional; the modal renders whatever is present::
+
+        {"title": str,                                   # header title
+         "version": str,                                 # small pill next to the title
+         "subtitle": str,                                # muted line under the title
+         "accent": int,                                  # hue 0-360; else derived from the title
+         "chips": [{"label": str, "tone": str, "icon": str}],   # quick-facts pills under the header
+         "sections": [{"heading": str,                   # section label
+                       "text": str,                      # paragraph
+                       "rows": [{"label": str, "value": str}],          # key/value grid
+                       "fields": [{"name": str, "type": str, "required": bool, "description": str}],
+                       "tags": [str],                    # chips
+                       "cards": [{"title": str, "description": str}],    # bordered cards
+                       "items": [str],                   # bullet list
+                       "badges": [str | {"label": str, "icon": str, "tone": str}]}]}
+
+    ``tone`` is one of ``accent | muted | success | warning``. Reusable by any component that wants
+    to surface fetched/dynamic data without a bespoke modal.
+    """
+
+    field_type: SerializableFieldTypes = FieldTypes.DATA_DISPLAY
+    button_text: str = "View"
+    button_icon: str = "Eye"
+
+
 class HandleInput(BaseInputMixin, ListableInputMixin, MetadataTraceMixin):
     """Represents an Input that has a Handle to a specific type (e.g. BaseLanguageModel, BaseRetriever, etc.).
 
@@ -102,18 +152,34 @@ class ToolsInput(BaseInputMixin, ListableInputMixin, MetadataTraceMixin, ToolMod
     real_time_refresh: bool = True
 
 
-class DataInput(HandleInput, InputTraceMixin, ListableInputMixin, ToolModeMixin):
-    """Represents an Input that has a Handle that receives a Data object.
+class JSONInput(HandleInput, InputTraceMixin, ListableInputMixin, ToolModeMixin):
+    """Represents an Input that has a Handle that receives a JSON object.
+
+    This is the new standard input for Langflow data structures.
+    DataInput is maintained as an alias for backwards compatibility.
 
     Attributes:
-        input_types (list[str]): A list of input types supported by this data input.
+        input_types (list[str]): A list of input types supported by this JSON input.
     """
 
-    input_types: list[str] = ["Data"]
+    input_types: list[str] = ["Data", "JSON"]
+
+
+# DataInput is maintained for backwards compatibility - it is now an alias to JSONInput
+DataInput = JSONInput
 
 
 class DataFrameInput(HandleInput, InputTraceMixin, ListableInputMixin, ToolModeMixin):
-    input_types: list[str] = ["DataFrame"]
+    """Represents an Input that has a Handle that receives a Table (DataFrame) object.
+
+    Note: This accepts DataFrame and Table types. For visual table inputs in the UI,
+    use TableInput instead (which has field_type: FieldTypes.TABLE).
+
+    Attributes:
+        input_types (list[str]): A list of input types supported by this input.
+    """
+
+    input_types: list[str] = ["DataFrame", "Table"]
 
 
 class PromptInput(BaseInputMixin, ListableInputMixin, InputTraceMixin, ToolModeMixin):
@@ -129,7 +195,7 @@ class CodeInput(BaseInputMixin, ListableInputMixin, InputTraceMixin, ToolModeMix
 
 
 class ModelInput(BaseInputMixin, ModelInputMixin, ListableInputMixin, InputTraceMixin, ToolModeMixin):
-    """Represents a model input field with optional LanguageModel connection support.
+    """Represents a model input field with optional model connection support.
 
     By default:
     - input_types=[] (no handle shown)
@@ -137,7 +203,9 @@ class ModelInput(BaseInputMixin, ModelInputMixin, ListableInputMixin, InputTrace
     - refresh_button=True
 
     When "Connect other models" is selected (value="connect_other_models"):
-    - input_types is set to ["LanguageModel"] to show the connection handle
+    - input_types is set based on model_type:
+      - "embedding" -> ["Embeddings"]
+      - "language" (default) -> ["LanguageModel"]
 
     Value format:
     - Can be a list of dicts: [{'name': 'gpt-4o', 'provider': 'OpenAI', ...}]
@@ -175,9 +243,10 @@ class ModelInput(BaseInputMixin, ModelInputMixin, ListableInputMixin, InputTrace
         - [{'name': 'gpt-4o'}] -> [{'name': 'gpt-4o'}] (unchanged)
         - 'connect_other_models' -> 'connect_other_models' (special value, keep as string)
         """
-        # Handle empty or None values
-        if v is None or v == "":
-            return v
+        # Handle empty or None values — normalize all to None so that
+        # ``self.<model_field>`` is None when nothing is selected.
+        if v is None or v in ("", []):
+            return None
 
         # Special case: keep "connect_other_models" as a string to enable connection mode
         if v == "connect_other_models":
@@ -210,35 +279,35 @@ class ModelInput(BaseInputMixin, ModelInputMixin, ListableInputMixin, InputTrace
 
     @model_validator(mode="after")
     def set_defaults(self):
-        """Handle connection mode and set defaults.
+        """Set default input_types based on model_type.
 
-        When value is "connect_other_models", set input_types to ["LanguageModel"]
-        to enable the connection handle. Otherwise, keep input_types empty.
+        Always set input_types to enable connection handles:
+        - "embedding" -> ["Embeddings"]
+        - "language" (default) -> ["LanguageModel"]
         """
-        # Check if we're in connection mode (user selected "Connect other models")
-        if self.value == "connect_other_models" and not self.input_types:
-            # Enable connection handle by setting input_types
-            # Use object.__setattr__ to avoid triggering validation recursion
-            object.__setattr__(self, "input_types", ["LanguageModel"])
+        # Always set input_types based on model_type if not explicitly provided
+        if not self.input_types:
+            default_input_type = "Embeddings" if self.model_type == "embedding" else "LanguageModel"
+            object.__setattr__(self, "input_types", [default_input_type])
 
-        # Set external_options if not explicitly provided
-        if self.external_options is None or len(self.external_options) == 0:
-            object.__setattr__(
-                self,
-                "external_options",
-                {
-                    "fields": {
-                        "data": {
-                            "node": {
-                                "name": "connect_other_models",
-                                "display_name": "Connect other models",
-                                "icon": "CornerDownLeft",
-                            }
-                        }
-                    },
-                },
-            )
         return self
+
+
+class DBProviderInput(BaseInputMixin, InputTraceMixin, ToolModeMixin):
+    """Represents the DB Provider selector.
+
+    Value format:
+    - {"backend_type": "chroma", "backend_config": {}}
+    - {"backend_type": "opensearch", "backend_config": {...}}
+
+    Default is intentionally an empty dict so the frontend can populate
+    it from the user's configured DB Provider on first render. Falls
+    back to Chroma server-side via ``_normalize_backend_selection``.
+    """
+
+    field_type: SerializableFieldTypes = FieldTypes.DB_PROVIDER
+    value: dict = Field(default_factory=dict)
+    input_types: list[str] = Field(default_factory=list)
 
 
 # Applying mixins to a specific input type
@@ -267,6 +336,7 @@ class StrInput(
         Raises:
             ValueError: If the value is not of a valid type or if the input is missing a required key.
         """
+        _reject_secret_in_non_password_field(v, info)
         if not isinstance(v, str) and v is not None:
             # Keep the warning for now, but we should change it to an error
             if info.data.get("input_types") and v.__class__.__name__ not in info.data.get("input_types"):
@@ -305,7 +375,8 @@ class MessageInput(StrInput, InputTraceMixin):
     input_types: list[str] = ["Message"]
 
     @staticmethod
-    def _validate_value(v: Any, _info):
+    def _validate_value(v: Any, info):
+        _reject_secret_in_non_password_field(v, info)
         # If v is a instance of Message, then its fine
         if isinstance(v, dict):
             return Message(**v)
@@ -349,6 +420,10 @@ class MessageTextInput(StrInput, MetadataTraceMixin, InputTraceMixin, ToolModeMi
         Raises:
             ValueError: If the value is not of a valid type or if the input is missing a required key.
         """
+        # SecretStr-rejection happens in the model_validator below, not here: `password`
+        # is declared after `value` so `info.data["password"]` isn't populated yet.
+        if isinstance(v, SecretStr):
+            return v
         value: str | AsyncIterator | Iterator | None = None
         if isinstance(v, dict):
             v = Message(**v)
@@ -374,6 +449,28 @@ class MessageTextInput(StrInput, MetadataTraceMixin, InputTraceMixin, ToolModeMi
             msg = f"Invalid value type {type(v)}"
             raise ValueError(msg)  # noqa: TRY004
         return value
+
+    @model_validator(mode="after")
+    def _reject_credential_in_non_password(self):
+        """Reject Credential-typed global variables unless the field is a password field.
+
+        Runs after all fields (including subclass-declared `password`) are set, so it
+        observes the correct value of `password` regardless of where in the MRO it is
+        declared. The equivalent field-level check on `value` cannot see `password`
+        when subclasses (e.g. MultilineInput, MultilineSecretInput) add it after the
+        inherited `value` field.
+        """
+        if isinstance(self.value, SecretStr) and not getattr(self, "password", False):
+            input_name = getattr(self, "name", "<unknown>")
+            msg = (
+                f"Cannot use a Credential-typed global variable in '{input_name}'. "
+                "Credential variables are only allowed in secret fields (API keys, tokens, etc.) "
+                "to prevent the value from being exposed in component outputs, logs, or traces. "
+                "Either select a Generic-typed variable, or change this variable's type to Generic "
+                "if it is not actually sensitive."
+            )
+            raise ValueError(msg)
+        return self
 
 
 class MultilineInput(MessageTextInput, AIMixin, MultilineMixin, InputTraceMixin, ToolModeMixin):
@@ -403,6 +500,14 @@ class MultilineSecretInput(MessageTextInput, MultilineMixin, InputTraceMixin):
     multiline: CoalesceBool = True
     password: CoalesceBool = Field(default=True)
     track_in_telemetry: CoalesceBool = False  # Never track secret inputs
+
+    @staticmethod
+    def _validate_value(v: Any, info):
+        # Password input: accept SecretStr (credential resolution); the base validator
+        # can't see ``password`` via info.data due to field-validation order.
+        if isinstance(v, SecretStr):
+            return v
+        return MessageTextInput._validate_value(v, info)  # noqa: SLF001
 
 
 class SecretStrInput(BaseInputMixin, DatabaseLoadMixin):
@@ -437,8 +542,12 @@ class SecretStrInput(BaseInputMixin, DatabaseLoadMixin):
         Raises:
             ValueError: If the value is not of a valid type or if the input is missing a required key.
         """
-        value: str | AsyncIterator | Iterator | None = None
-        if isinstance(v, str):
+        value: str | SecretStr | AsyncIterator | Iterator | None = None
+        if isinstance(v, SecretStr):
+            # Credential globals arrive pre-wrapped from VariableService; consumers
+            # unwrap with .get_secret_value() at the provider boundary.
+            value = v
+        elif isinstance(v, str):
             value = v
         elif isinstance(v, Message):
             value = v.text
@@ -494,12 +603,33 @@ class IntInput(BaseInputMixin, ListableInputMixin, RangeMixin, MetadataTraceMixi
         Raises:
             ValueError: If the value is not of a valid type or if the input is missing a required key.
         """
-        if v and not isinstance(v, int | float):
-            msg = f"Invalid value type {type(v)} for input {info.data.get('name')}."
-            raise ValueError(msg)
+        _reject_secret_in_non_password_field(v, info)
+        if isinstance(v, int):
+            return v
         if isinstance(v, float):
-            v = int(v)
-        return v
+            return int(v)
+        if isinstance(v, Message):
+            v = v.text
+        elif isinstance(v, Data):
+            v = v.data.get(v.text_key, "")
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return 0
+            try:
+                return int(v)
+            except ValueError:
+                pass
+            try:
+                return int(float(v))
+            except ValueError:
+                input_name = info.data.get("name", "unknown")
+                msg = f"Could not convert '{v}' to integer for input {input_name}."
+                raise ValueError(msg) from None
+        if not v:
+            return 0
+        msg = f"Invalid value type {type(v)} for input {info.data.get('name')}."
+        raise ValueError(msg)
 
 
 class FloatInput(BaseInputMixin, ListableInputMixin, RangeMixin, MetadataTraceMixin, ToolModeMixin):
@@ -530,12 +660,29 @@ class FloatInput(BaseInputMixin, ListableInputMixin, RangeMixin, MetadataTraceMi
         Raises:
             ValueError: If the value is not of a valid type or if the input is missing a required key.
         """
-        if v and not isinstance(v, int | float):
-            msg = f"Invalid value type {type(v)} for input {info.data.get('name')}."
-            raise ValueError(msg)
+        _reject_secret_in_non_password_field(v, info)
+        if isinstance(v, float):
+            return v
         if isinstance(v, int):
-            v = float(v)
-        return v
+            return float(v)
+        if isinstance(v, Message):
+            v = v.text
+        elif isinstance(v, Data):
+            v = v.data.get(v.text_key, "")
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return 0.0
+            try:
+                return float(v)
+            except ValueError:
+                input_name = info.data.get("name", "unknown")
+                msg = f"Could not convert '{v}' to float for input {input_name}."
+                raise ValueError(msg) from None
+        if not v:
+            return 0.0
+        msg = f"Invalid value type {type(v)} for input {info.data.get('name')}."
+        raise ValueError(msg)
 
 
 class BoolInput(BaseInputMixin, ListableInputMixin, MetadataTraceMixin, ToolModeMixin):
@@ -552,6 +699,17 @@ class BoolInput(BaseInputMixin, ListableInputMixin, MetadataTraceMixin, ToolMode
     field_type: SerializableFieldTypes = FieldTypes.BOOLEAN
     value: CoalesceBool = False
     track_in_telemetry: CoalesceBool = True  # Safe boolean flag
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def coerce_message_or_data(cls, v: Any):
+        # Allow BoolInput to receive Message/Data (e.g. MCP tool inputs): extract text
+        # before CoalesceBool runs. See https://github.com/langflow-ai/langflow/issues/9424
+        if isinstance(v, Message):
+            return v.text
+        if isinstance(v, Data):
+            return v.data.get(v.text_key, "")
+        return v
 
 
 class NestedDictInput(
@@ -574,6 +732,36 @@ class NestedDictInput(
     field_type: SerializableFieldTypes = FieldTypes.NESTED_DICT
     value: dict | None = {}
 
+    @field_validator("value", mode="before")
+    @classmethod
+    def validate_value(cls, v: Any, info):
+        _reject_secret_in_non_password_field(v, info)
+        if v is None or isinstance(v, dict):
+            return v
+        if isinstance(v, Message):
+            v = v.text
+        elif isinstance(v, Data):
+            v = v.data.get(v.text_key, "")
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return {}
+            import json
+
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as e:
+                input_name = info.data.get("name", "unknown")
+                msg = f"Could not parse JSON string for input {input_name}: {e}"
+                raise ValueError(msg) from None
+            if not isinstance(parsed, dict):
+                input_name = info.data.get("name", "unknown")
+                msg = f"Expected a JSON object for input {input_name}, got {type(parsed).__name__}."
+                raise TypeError(msg)
+            return parsed
+        msg = f"Invalid value type {type(v)} for input {info.data.get('name')}."
+        raise TypeError(msg)
+
 
 class DictInput(BaseInputMixin, ListableInputMixin, InputTraceMixin, ToolModeMixin):
     """Represents a dictionary field.
@@ -588,6 +776,39 @@ class DictInput(BaseInputMixin, ListableInputMixin, InputTraceMixin, ToolModeMix
 
     field_type: SerializableFieldTypes = FieldTypes.DICT
     value: dict = Field(default_factory=dict)
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def validate_value(cls, v: Any, info):
+        # Allow DictInput to receive Data/Message (e.g. MCP tool inputs) + coerce JSON
+        # strings to dicts. See https://github.com/langflow-ai/langflow/issues/9424
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, Message):
+            v = v.text
+        elif isinstance(v, Data):
+            # Pass through the data dict directly when it's already a mapping.
+            if isinstance(v.data, dict):
+                return v.data
+            v = v.data.get(v.text_key, "")
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return {}
+            import json
+
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as e:
+                input_name = info.data.get("name", "unknown")
+                msg = f"Could not parse JSON string for input {input_name}: {e}"
+                raise ValueError(msg) from None
+            if not isinstance(parsed, dict):
+                input_name = info.data.get("name", "unknown")
+                msg = f"Expected a JSON object for input {input_name}, got {type(parsed).__name__}."
+                raise TypeError(msg)
+            return parsed
+        return v
 
 
 class DropdownInput(BaseInputMixin, DropDownMixin, MetadataTraceMixin, ToolModeMixin):
@@ -728,7 +949,8 @@ class MultiselectInput(BaseInputMixin, ListableInputMixin, DropDownMixin, Metada
 
     @field_validator("value")
     @classmethod
-    def validate_value(cls, v: Any, _info):
+    def validate_value(cls, v: Any, info):
+        _reject_secret_in_non_password_field(v, info)
         # Check if value is a list of dicts
         if not isinstance(v, list):
             msg = f"MultiselectInput value must be a list. Value: '{v}'"
@@ -738,6 +960,53 @@ class MultiselectInput(BaseInputMixin, ListableInputMixin, DropDownMixin, Metada
                 msg = f"MultiselectInput value must be a list of strings. Item: '{item}' is not a string"
                 raise ValueError(msg)  # noqa: TRY004
         return v
+
+
+class ActionPickerInput(BaseInputMixin, ListableInputMixin, DropDownMixin, MetadataTraceMixin, ToolModeMixin):
+    """A multi-select rendered as a '+' add button with removable badges below.
+
+    Same value shape as ``MultiselectInput`` (a list of selected option strings); only the
+    rendering differs (the dedicated frontend picker). ``combobox`` allows custom entries.
+    """
+
+    field_type: SerializableFieldTypes = FieldTypes.ACTION_PICKER
+    options: list[str] = Field(default_factory=list)
+    is_list: bool = Field(default=True, alias="list")
+    combobox: CoalesceBool = True
+
+    @field_validator("value")
+    @classmethod
+    def validate_value(cls, v: Any, _info):
+        if not isinstance(v, list):
+            msg = f"ActionPickerInput value must be a list. Value: '{v}'"
+            raise ValueError(msg)  # noqa: TRY004
+        for item in v:
+            if not isinstance(item, str):
+                msg = f"ActionPickerInput value must be a list of strings. Item: '{item}' is not a string"
+                raise ValueError(msg)  # noqa: TRY004
+        return v
+
+
+class DurationInput(BaseInputMixin, MetadataTraceMixin, ToolModeMixin):
+    """A duration field rendered as a number + a unit segmented toggle on one row.
+
+    The value is a composite ``{"value": <int>, "unit": <str>}``; ``options`` are the
+    selectable units (e.g. Minutes/Hours/Days).
+    """
+
+    field_type: SerializableFieldTypes = FieldTypes.DURATION
+    options: list[str] = Field(default_factory=lambda: ["Minutes", "Hours", "Days"])
+    value: dict[str, Any] = Field(default_factory=lambda: {"value": 0, "unit": "Days"})
+
+    @field_validator("value")
+    @classmethod
+    def validate_value(cls, v: Any):
+        if isinstance(v, int):
+            return {"value": v, "unit": "Days"}
+        if not isinstance(v, dict):
+            msg = f"DurationInput value must be a dict with 'value' and 'unit'. Got: '{v}'"
+            raise ValueError(msg)  # noqa: TRY004
+        return {"value": int(v.get("value", 0) or 0), "unit": v.get("unit", "Days")}
 
 
 class FileInput(BaseInputMixin, ListableInputMixin, FileMixin, MetadataTraceMixin, ToolModeMixin):
@@ -798,6 +1067,7 @@ InputTypes: TypeAlias = (
     | QueryInput
     | DefaultPromptField
     | BoolInput
+    | JSONInput
     | DataInput
     | DictInput
     | DropdownInput
@@ -826,9 +1096,15 @@ InputTypes: TypeAlias = (
     | SliderInput
     | DataFrameInput
     | TabInput
+    | ActionPickerInput
+    | DurationInput
+    | DataDisplayInput
 )
 
 InputTypesMap: dict[str, type[InputTypes]] = {t.__name__: t for t in get_args(InputTypes)}
+# DataInput is an alias for JSONInput, so its __name__ is "JSONInput".
+# Add explicit entry so serialized configs using "DataInput" still deserialize correctly.
+InputTypesMap["DataInput"] = JSONInput
 
 
 def instantiate_input(input_type: str, data: dict) -> InputTypes:

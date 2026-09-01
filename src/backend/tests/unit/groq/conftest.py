@@ -1,8 +1,11 @@
+import importlib.util
 import json
 import os
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -22,6 +25,16 @@ def pytest_collection_modifyitems(config, items):  # noqa: ARG001
     for item in items:
         if "requires_api_key" in item.keywords and not os.getenv("GROQ_API_KEY"):
             item.add_marker(skip_no_api_key)
+
+
+@pytest.fixture(autouse=True)
+def fake_groq(monkeypatch):
+    if importlib.util.find_spec("groq") is not None:
+        return
+
+    groq = ModuleType("groq")
+    groq.Groq = MagicMock(name="Groq")
+    monkeypatch.setitem(sys.modules, "groq", groq)
 
 
 @pytest.fixture
@@ -256,6 +269,34 @@ def mock_groq_client_rate_limit():
     def _create_mock_client(*_args, **_kwargs):
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = RuntimeError("Rate limit exceeded")
+        return mock_client
+
+    return _create_mock_client
+
+
+@pytest.fixture
+def mock_groq_client_chat_not_supported():
+    """Mock Groq client that raises 'does not support chat completions' error."""
+
+    def _create_mock_client(*_args, **_kwargs):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = ValueError(
+            "Error: model 'some-model' does not support chat completions"
+        )
+        return mock_client
+
+    return _create_mock_client
+
+
+@pytest.fixture
+def mock_groq_client_chat_terms_required():
+    """Mock Groq client that raises a terms_required error."""
+
+    def _create_mock_client(*_args, **_kwargs):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = ValueError(
+            "Error: model_terms_required - please accept the terms"
+        )
         return mock_client
 
     return _create_mock_client

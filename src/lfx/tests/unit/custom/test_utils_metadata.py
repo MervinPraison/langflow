@@ -297,6 +297,35 @@ class TestComponent(CustomComponent):
         assert dep.version == "1.21.0"
         assert not dep.is_local
 
+    def test_get_distribution_version_deterministic(self):
+        """Test that _get_distribution_version picks the alphabetically first distribution.
+
+        When multiple distributions provide the same import name, the result must
+        be deterministic regardless of the order returned by packages_distributions().
+        """
+        from lfx.custom.dependency_analyzer import _get_distribution_version
+
+        # Simulate two different orderings of dist names for the same import
+        fake_map_asc = {"myimport": ["alpha-pkg", "zeta-pkg"]}
+        fake_map_desc = {"myimport": ["zeta-pkg", "alpha-pkg"]}
+
+        mock_dist = Mock()
+        mock_dist.version = "1.0.0"
+
+        for fake_map in (fake_map_asc, fake_map_desc):
+            _get_distribution_version.cache_clear()
+            with (
+                patch("lfx.custom.dependency_analyzer._get_packages_distributions", return_value=fake_map),
+                patch("lfx.custom.dependency_analyzer.md.distribution", return_value=mock_dist) as mock_md,
+            ):
+                result = _get_distribution_version("myimport")
+                assert result == "1.0.0"
+                # Should always pick "alpha-pkg" regardless of input order
+                mock_md.assert_called_once_with("alpha-pkg")
+
+        # Clean up the lru_cache so other tests aren't affected
+        _get_distribution_version.cache_clear()
+
     def test_no_optional_dependency_classification(self):
         """Test that the simplified analyzer doesn't classify any dependencies as optional."""
         from lfx.custom.dependency_analyzer import analyze_dependencies
@@ -341,6 +370,78 @@ class TestMetadataWithDependencies:
 
     def test_build_component_metadata_includes_dependencies(self):
         """Test that build_component_metadata includes dependency analysis."""
+
+    @pytest.mark.parametrize(
+        ("base_class", "module_name", "display_name", "expected_provider_id"),
+        [
+            ("model", "_lfx_ext.official.openai.components.openai.chat", "OpenAI Embeddings", "openai"),
+            ("embedding", "lfx_ibm.components.ibm.watsonx_embeddings", "IBM watsonx.ai", "ibm-watsonx"),
+            ("model", "_lfx_ext.official.mistral.mistral", "Mistral AI Chat", "mistral"),
+        ],
+    )
+    def test_build_component_metadata_stamps_stable_model_provider(
+        self, base_class, module_name, display_name, expected_provider_id
+    ):
+        from lfx.base.embeddings.model import LCEmbeddingsModel
+        from lfx.base.models.model import LCModelComponent
+
+        component_base = LCModelComponent if base_class == "model" else LCEmbeddingsModel
+
+        class ProviderComponent(component_base):
+            pass
+
+        component = ProviderComponent()
+        component.display_name = display_name
+        component._code = "class ProviderComponent: pass"
+        frontend = Mock(metadata={}, display_name=display_name)
+
+        build_component_metadata(frontend, component, module_name, "ProviderComponent")
+
+        assert frontend.metadata["model_provider_policy_mode"] == "standalone"
+        assert frontend.metadata["model_provider_id"] == expected_provider_id
+        assert frontend.metadata["model_provider_display_name"]
+
+    def test_build_component_metadata_does_not_classify_unrelated_component(self):
+        from lfx.custom.custom_component.component import Component
+
+        component = Component()
+        component._code = "class UtilityComponent: pass"
+        frontend = Mock(metadata={}, display_name="Utility")
+
+        build_component_metadata(frontend, component, "lfx_bundles.mistral.utility", "UtilityComponent")
+
+        assert "model_provider_id" not in frontend.metadata
+
+    def test_build_component_metadata_stamps_inherited_annotated_delegate_mode(self):
+        from lfx.base.models.model import LCModelComponent
+
+        class DelegatingSelectorBase(LCModelComponent):
+            model_provider_policy_mode: str = "delegate"
+
+        class UnifiedSelectorComponent(DelegatingSelectorBase):
+            pass
+
+        component = UnifiedSelectorComponent()
+        component.display_name = "Language Model"
+        component._code = "class UnifiedSelectorComponent: pass"
+        frontend = Mock(
+            metadata={
+                "model_provider_id": "spoofed-provider",
+                "model_provider_display_name": "Spoofed Provider",
+            },
+            display_name=component.display_name,
+        )
+
+        build_component_metadata(
+            frontend,
+            component,
+            "lfx.components.models_and_agents.language_model",
+            "UnifiedSelectorComponent",
+        )
+
+        assert frontend.metadata["model_provider_policy_mode"] == "delegate"
+        assert "model_provider_id" not in frontend.metadata
+        assert "model_provider_display_name" not in frontend.metadata
 
     def test_build_from_inputs_without_module_generates_default(self):
         """Test that build_component_metadata includes dependency analysis results."""

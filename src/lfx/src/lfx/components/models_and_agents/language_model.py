@@ -2,24 +2,23 @@ from lfx.base.models.model import LCModelComponent
 from lfx.base.models.unified_models import (
     get_language_model_options,
     get_llm,
-    update_model_options_in_build_config,
+    handle_model_input_update,
 )
 from lfx.base.models.watsonx_constants import IBM_WATSONX_URLS
-from lfx.field_typing import LanguageModel
+from lfx.components.models_and_agents.model_selection import apply_model_overrides
+from lfx.field_typing.constants import LanguageModel
 from lfx.field_typing.range_spec import RangeSpec
 from lfx.inputs.inputs import BoolInput, DropdownInput, StrInput
 from lfx.io import IntInput, MessageInput, ModelInput, MultilineInput, SecretStrInput, SliderInput
 
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
-
 
 class LanguageModelComponent(LCModelComponent):
+    model_provider_policy_mode = "delegate"
     display_name = "Language Model"
     description = "Runs a language model given a specified provider."
     documentation: str = "https://docs.langflow.org/components-models"
     icon = "brain-circuit"
     category = "models"
-    priority = 0  # Set priority to 0 to make it appear first
 
     inputs = [
         ModelInput(
@@ -29,10 +28,29 @@ class LanguageModelComponent(LCModelComponent):
             real_time_refresh=True,
             required=True,
         ),
+        StrInput(
+            name="model_name",
+            display_name="Model Name Override",
+            info=(
+                "Optional model name to use instead of the selected model. "
+                "Can be set from a global variable for runtime model selection."
+            ),
+            advanced=True,
+            load_from_db=False,
+        ),
+        StrInput(
+            name="provider",
+            display_name="Provider Override",
+            info=(
+                "Optional provider to use with Model Name Override. Leave blank to use the selected model's provider."
+            ),
+            advanced=True,
+            load_from_db=False,
+        ),
         SecretStrInput(
             name="api_key",
             display_name="API Key",
-            info="Model Provider API key",
+            info="Overrides global provider settings. Leave blank to use your pre-configured API Key.",
             required=False,
             show=True,
             real_time_refresh=True,
@@ -44,6 +62,7 @@ class LanguageModelComponent(LCModelComponent):
             info="The base URL of the API (IBM watsonx.ai only)",
             options=IBM_WATSONX_URLS,
             value=IBM_WATSONX_URLS[0],
+            combobox=True,
             show=False,
             real_time_refresh=True,
         ),
@@ -54,14 +73,12 @@ class LanguageModelComponent(LCModelComponent):
             show=False,
             required=False,
         ),
-        MessageInput(
+        StrInput(
             name="ollama_base_url",
             display_name="Ollama API URL",
-            info=f"Endpoint of the Ollama API (Ollama only). Defaults to {DEFAULT_OLLAMA_URL}",
-            value=DEFAULT_OLLAMA_URL,
+            info="Endpoint of the Ollama API (Ollama only)",
             show=False,
             real_time_refresh=True,
-            load_from_db=True,
         ),
         MessageInput(
             name="input_value",
@@ -99,8 +116,15 @@ class LanguageModelComponent(LCModelComponent):
     ]
 
     def build_model(self) -> LanguageModel:
+        model = apply_model_overrides(
+            self.model,
+            model_name=getattr(self, "model_name", None),
+            provider=getattr(self, "provider", None),
+            user_id=self.user_id,
+            get_options=get_language_model_options,
+        )
         return get_llm(
-            model=self.model,
+            model=model,
             user_id=self.user_id,
             api_key=self.api_key,
             temperature=self.temperature,
@@ -113,32 +137,4 @@ class LanguageModelComponent(LCModelComponent):
 
     def update_build_config(self, build_config: dict, field_value: str, field_name: str | None = None):
         """Dynamically update build config with user-filtered model options."""
-        # Update model options
-        build_config = update_model_options_in_build_config(
-            component=self,
-            build_config=build_config,
-            cache_key_prefix="language_model_options",
-            get_options_func=get_language_model_options,
-            field_name=field_name,
-            field_value=field_value,
-        )
-
-        # Show/hide provider-specific fields based on selected model
-        # Get current model value - from field_value if model is being changed, otherwise from build_config
-        current_model_value = field_value if field_name == "model" else build_config.get("model", {}).get("value")
-        if isinstance(current_model_value, list) and len(current_model_value) > 0:
-            selected_model = current_model_value[0]
-            provider = selected_model.get("provider", "")
-
-            # Show/hide watsonx fields
-            is_watsonx = provider == "IBM WatsonX"
-            build_config["base_url_ibm_watsonx"]["show"] = is_watsonx
-            build_config["project_id"]["show"] = is_watsonx
-            build_config["base_url_ibm_watsonx"]["required"] = is_watsonx
-            build_config["project_id"]["required"] = is_watsonx
-
-            # Show/hide Ollama fields
-            is_ollama = provider == "Ollama"
-            build_config["ollama_base_url"]["show"] = is_ollama
-
-        return build_config
+        return handle_model_input_update(self, build_config, field_value, field_name)

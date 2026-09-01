@@ -3,12 +3,17 @@ from datetime import datetime, timezone
 import pytest
 from httpx import AsyncClient
 from langflow.services.auth.utils import create_super_user, get_password_hash
+from langflow.services.database.models.file.model import File
 from langflow.services.database.models.user import UserUpdate
 from langflow.services.database.models.user.model import User
 from langflow.services.database.utils import session_getter
 from langflow.services.deps import get_db_service, get_settings_service
 from lfx.services.settings.constants import DEFAULT_SUPERUSER
+from sqlalchemy import text
 from sqlmodel import select
+
+CURRENT_CREDENTIAL = "test" + "password"
+REPLACEMENT_CREDENTIAL = "new" + "password"
 
 
 @pytest.fixture
@@ -205,18 +210,19 @@ async def test_patch_user(client: AsyncClient, active_user, logged_in_headers):
 @pytest.mark.api_key_required
 async def test_patch_reset_password(client: AsyncClient, active_user, logged_in_headers):
     user_id = active_user.id
-    update_data = UserUpdate(
-        password="newpassword",  # noqa: S106
-    )
+    update_data = {
+        "current_password": CURRENT_CREDENTIAL,
+        "password": REPLACEMENT_CREDENTIAL,
+    }
 
     response = await client.patch(
         f"/api/v1/users/{user_id}/reset-password",
-        json=update_data.model_dump(),
+        json=update_data,
         headers=logged_in_headers,
     )
     assert response.status_code == 200, response.json()
     # Now we need to test if the new password works
-    login_data = {"username": active_user.username, "password": "newpassword"}
+    login_data = {"username": active_user.username, "password": REPLACEMENT_CREDENTIAL}
     response = await client.post("api/v1/login", data=login_data)
     assert response.status_code == 200
 
@@ -260,11 +266,86 @@ async def test_delete_user_wrong_id(client: AsyncClient, super_user_headers):
 
 
 @pytest.mark.api_key_required
+async def test_delete_user_cascades_to_files(client: AsyncClient, test_user, super_user_headers):  # noqa: ARG001
+    """Deleting a user should cascade-delete associated file records (e.g. _mcp_servers)."""
+    user_id = test_user["id"]
+
+    # Create a file record owned by the user
+    import tempfile
+
+    async with session_getter(get_db_service()) as session:
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            file_path = f"{tmpdirname}/{user_id}"
+            file = File(user_id=user_id, name=f"_mcp_servers_{user_id}.json", path=file_path, size=42)
+            session.add(file)
+            await session.commit()
+            file_id = file.id
+
+    # Verify the file exists
+    async with session_getter(get_db_service()) as session:
+        assert await session.get(File, file_id) is not None
+
+    # Delete the user using a Core-level bulk DELETE to bypass ORM relationship cascades
+    async with session_getter(get_db_service()) as session:
+        from sqlalchemy import delete
+
+        await session.exec(delete(User).where(User.id == user_id))
+        await session.commit()
+
+    # Verify the file was cascade-deleted by the database FK
+    async with session_getter(get_db_service()) as session:
+        assert await session.get(File, file_id) is None
+
+
+@pytest.mark.api_key_required
+async def test_delete_user_db_level_cascade(client):  # noqa: ARG001
+    """Raw SQL DELETE on users should cascade-delete File rows via DB-level ON DELETE CASCADE."""
+    import tempfile
+
+    # Create a user and an associated file
+    async with session_getter(get_db_service()) as session:
+        user = User(
+            username="cascade_test_user",
+            password=get_password_hash("testpassword"),
+            is_active=True,
+            last_login_at=datetime.now(tz=timezone.utc),
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        user_id = user.id
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            file_path = f"{tmpdirname}/{user_id}"
+            file = File(user_id=user_id, name=f"_mcp_servers_{user_id}.json", path=file_path, size=42)
+            session.add(file)
+            await session.commit()
+            await session.refresh(file)
+            file_id = file.id
+
+    # Verify the file exists before deletion
+    async with session_getter(get_db_service()) as session:
+        assert await session.get(File, file_id) is not None
+
+    # Delete the user via raw SQL (bypasses ORM cascade, tests DB-level ON DELETE CASCADE)
+    db_service = get_db_service()
+    async with db_service.engine.connect() as conn:
+        await conn.execute(text("PRAGMA foreign_keys = ON"))
+        await conn.execute(text('DELETE FROM "user" WHERE id = :id'), {"id": str(user_id)})
+        await conn.commit()
+
+    # Verify the file was cascade-deleted at the DB level (use a fresh session to avoid cache)
+    async with db_service.engine.connect() as conn:
+        result = await conn.execute(text("SELECT id FROM file WHERE id = :id"), {"id": str(file_id)})
+        assert result.first() is None
+
+
+@pytest.mark.api_key_required
 async def test_normal_user_cant_delete_user(client: AsyncClient, test_user, logged_in_headers):
     user_id = test_user["id"]
     response = await client.delete(f"/api/v1/users/{user_id}", headers=logged_in_headers)
     assert response.status_code == 403
-    assert response.json() == {"detail": "The user doesn't have enough privileges"}
+    assert response.json() == {"detail": "Permission denied"}
 
 
 # ==================== Profile Picture Tests ====================

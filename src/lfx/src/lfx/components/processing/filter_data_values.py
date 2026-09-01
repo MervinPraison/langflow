@@ -9,13 +9,15 @@ class DataFilterComponent(Component):
     display_name = "Filter Values"
     description = (
         "Filter a list of data items based on a specified key, filter value,"
-        " and comparison operator. Check advanced options to select match comparision."
+        " and comparison operator. Check advanced options to select match comparison."
     )
     icon = "filter"
     beta = True
     name = "FilterDataValues"
     legacy = True
-    replacement = ["processing.DataOperations"]
+    # No direct successor: the equivalent "Filter Values" operation was removed
+    # from the Operations component rather than carried forward.
+    replacement = []
 
     inputs = [
         DataInput(name="input_data", display_name="Input Data", info="The list of data items to filter.", is_list=True),
@@ -24,14 +26,14 @@ class DataFilterComponent(Component):
             display_name="Filter Key",
             info="The key to filter on (e.g., 'route').",
             value="route",
-            input_types=["Data"],
+            input_types=["Data", "JSON"],
         ),
         MessageTextInput(
             name="filter_value",
             display_name="Filter Value",
             info="The value to filter by (e.g., 'CMIP').",
             value="CMIP",
-            input_types=["Data"],
+            input_types=["Data", "JSON"],
         ),
         DropdownInput(
             name="operator",

@@ -90,6 +90,10 @@ const config = {
           "0%, 100%": { transform: "scale(100%)" },
           "50%": { transform: "scale(120%)" },
         },
+        jiggle: {
+          "0%, 100%": { transform: "rotate(-1deg)" },
+          "50%": { transform: "rotate(1deg)" },
+        },
         "border-beam": {
           "100%": {
             "offset-distance": "100%",
@@ -109,6 +113,7 @@ const config = {
         wiggle: "wiggle 150ms ease-in-out 1",
         "pulse-pink": "pulse-pink 2s linear infinite",
         "slow-wiggle": "wiggle 500ms ease-in-out 1",
+        jiggle: "jiggle 150ms ease-in-out infinite",
         "border-beam": "border-beam calc(var(--duration)*1s) infinite linear",
       },
       colors: {
@@ -172,6 +177,9 @@ const config = {
         "success-foreground": "var(--success-foreground)",
         "accent-pink-foreground": "hsl(var(--accent-pink-foreground))",
         "accent-purple-foreground": "hsl(var(--accent-purple-foreground))",
+        "accent-purple-muted": "hsl(var(--accent-purple-muted))",
+        "accent-purple-muted-foreground":
+          "hsl(var(--accent-purple-muted-foreground))",
         "accent-red-foreground": "hsl(var(--accent-red-foreground))",
         filter: {
           foreground: "var(--filter-foreground)",
@@ -197,6 +205,10 @@ const config = {
         hover: "var(--hover)",
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
+        // `border-control` — the boundary that identifies an interactive
+        // control. Deliberately separate from `border`/`input`, which are also
+        // used for decorative edges and panel fills. See --control-boundary.
+        control: "hsl(var(--control-boundary))",
         ring: "hsl(var(--ring))",
         "error-red": "hsl(var(--error-red))",
         "error-red-border": "hsl(var(--error-red-border))",
@@ -244,9 +256,24 @@ const config = {
           DEFAULT: "hsl(var(--accent-indigo))",
           foreground: "hsl(var(--accent-indigo-foreground))",
         },
+        "accent-blue": {
+          DEFAULT: "hsl(var(--accent-blue))",
+          foreground: "hsl(var(--accent-blue-foreground))",
+          muted: "hsl(var(--accent-blue-muted))",
+          "muted-foreground": "hsl(var(--accent-blue-muted-foreground))",
+        },
+        "deployment-callout": {
+          DEFAULT: "hsl(var(--deployment-callout))",
+          border: "hsl(var(--deployment-callout-border))",
+          foreground: "hsl(var(--deployment-callout-foreground))",
+        },
         "accent-pink": {
           DEFAULT: "hsl(var(--accent-pink))",
           foreground: "hsl(var(--accent-pink-foreground))",
+        },
+        "accent-assistant": {
+          brand: "hsl(var(--accent-assistant-brand))",
+          purple: "hsl(var(--accent-assistant-purple))",
         },
         popover: {
           DEFAULT: "hsl(var(--popover))",
@@ -356,6 +383,12 @@ const config = {
         xxs: "11px",
         mmd: "13px",
       },
+      height: {
+        4.5: "18px",
+      },
+      width: {
+        4.5: "18px",
+      },
     },
   },
 
@@ -450,10 +483,6 @@ const config = {
         },
         ".text-align-last-right": {
           "text-align-last": "right",
-        },
-        ":focus-visible": {
-          outline: "none  !important",
-          outlineOffset: "0px !important",
         },
         ".note-node-markdown": {
           lineHeight: "1",

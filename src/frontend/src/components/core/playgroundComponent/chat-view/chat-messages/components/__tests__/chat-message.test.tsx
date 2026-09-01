@@ -174,19 +174,37 @@ describe("ChatMessage Component", () => {
     ).toBeInTheDocument();
   });
 
+  // Regression guard: the actions row used to be hidden with `invisible` +
+  // `group-hover:visible`, which removes it from the tab order entirely
+  // (visibility:hidden elements can't receive focus) — a keyboard-only user
+  // could never Tab to copy/edit/feedback. It must instead be hidden via
+  // opacity + pointer-events, which keeps it focusable, and reveal on
+  // `group-focus-within` as well as `group-hover` (WCAG 2.1.1).
+  it("keeps the message actions focus-reachable instead of hiding them via visibility", () => {
+    render(<ChatMessage {...defaultProps} />);
+
+    const actionsButton = screen.getByTestId("edit-message-button");
+    const wrapper = actionsButton.parentElement as HTMLElement;
+
+    expect(wrapper.className).not.toContain("invisible");
+    expect(wrapper.className).not.toMatch(/(?<!in)\bvisible\b/);
+    expect(wrapper.className).toContain("opacity-0");
+    expect(wrapper.className).toContain("group-focus-within:opacity-100");
+  });
+
   it("renders user message with files even when text is empty", () => {
     const propsWithFiles = {
       ...defaultProps,
       chat: {
         ...mockChat,
         message: "",
-        files: ["/path/to/file.jpg"],
+        files: ["/path/to/file.pdf"],
       },
     };
 
     render(<ChatMessage {...propsWithFiles} />);
-    // Should render UserMessage with file preview (shows loading icon for files)
-    expect(screen.getByTestId("loading-icon")).toBeInTheDocument();
+    // Should render UserMessage with file preview (non-image files show File icon)
+    expect(screen.getByTestId("forwarded-icon")).toBeInTheDocument();
   });
 
   it("renders bot message when no text and no files", () => {
@@ -202,6 +220,46 @@ describe("ChatMessage Component", () => {
     render(<ChatMessage {...emptyProps} />);
     // Empty user message with no files should render as BotMessage
     expect(screen.getByTestId("div-chat-message")).toBeInTheDocument();
+  });
+
+  it("hides an empty partial placeholder that is not the building last message", () => {
+    const placeholderProps = {
+      ...defaultProps,
+      lastMessage: false,
+      chat: {
+        ...mockChat,
+        isSend: false,
+        message: "",
+        files: [],
+        content_blocks: [],
+        properties: { ...mockChat.properties, state: "partial" },
+      },
+    };
+
+    render(<ChatMessage {...placeholderProps} />);
+    expect(screen.queryByTestId("div-chat-message")).not.toBeInTheDocument();
+  });
+
+  it("hides a partial placeholder whose Agent Steps block has only non-tool content", () => {
+    // The paused-agent bubble carries an "Agent Steps" block with a text 'Input' content
+    // (no tool_use), which renders nothing — it must still be hidden, not left as an empty bubble.
+    const placeholderProps = {
+      ...defaultProps,
+      lastMessage: false,
+      chat: {
+        ...mockChat,
+        isSend: false,
+        message: "",
+        files: [],
+        content_blocks: [
+          { title: "Agent Steps", contents: [{ type: "text", text: "Input" }] },
+        ],
+        properties: { ...mockChat.properties, state: "partial" },
+      },
+    };
+
+    render(<ChatMessage {...placeholderProps} />);
+    expect(screen.queryByTestId("div-chat-message")).not.toBeInTheDocument();
   });
 });
 
@@ -231,7 +289,7 @@ describe("ThinkingMessage Component", () => {
     render(<ThinkingMessage isThinking={false} duration={3000} />);
 
     const icon = screen.getByTestId("icon-Check");
-    expect(icon.className).toContain("text-emerald-400");
+    expect(icon.className).toContain("text-accent-emerald-foreground");
   });
 
   it("formats time in minutes when duration exceeds 60 seconds", () => {

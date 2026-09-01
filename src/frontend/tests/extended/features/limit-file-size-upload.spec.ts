@@ -1,8 +1,11 @@
-import * as dotenv from "dotenv";
 import path from "path";
 import { expect, test } from "../../fixtures";
 import { awaitBootstrapTest } from "../../utils/await-bootstrap-test";
-import { initialGPTsetup } from "../../utils/initialGPTsetup";
+import { TEXTS } from "../../utils/constants/texts";
+import {
+  closeParametersPanel,
+  openParametersPanel,
+} from "../../utils/open-advanced-options";
 
 test(
   "user should not be able to upload a file larger than the limit",
@@ -22,28 +25,21 @@ test(
         },
       });
     });
-    test.skip(
-      !process?.env?.OPENAI_API_KEY,
-      "OPENAI_API_KEY required to run this test",
-    );
-
-    if (!process.env.CI) {
-      dotenv.config({ path: path.resolve(__dirname, "../../.env") });
-    }
-
     await awaitBootstrapTest(page);
 
     await page.getByTestId("side_nav_options_all-templates").click();
-    await page.getByRole("heading", { name: "Basic Prompting" }).click();
-    await initialGPTsetup(page);
-
+    await page
+      .getByRole("heading", { name: TEXTS.templateBasicPrompting })
+      .click();
     await page.waitForSelector("text=Chat Input", { timeout: 30000 });
 
-    await page.getByText("Chat Input", { exact: true }).click();
-    await page.getByTestId("edit-button-modal").last().click();
-    await page.getByText("Close").last().click();
+    await page.getByText(TEXTS.componentChatInput, { exact: true }).click();
+    await openParametersPanel(page);
+    await closeParametersPanel(page);
 
-    await page.getByRole("button", { name: "Playground", exact: true }).click();
+    await page
+      .getByRole("button", { name: TEXTS.playground, exact: true })
+      .click();
 
     await page.waitForSelector('[data-testid="input-chat-playground"]', {
       timeout: 100000,
@@ -65,5 +61,7 @@ test(
         ).toFixed(2)} KB`,
       ),
     ).toBeVisible();
+
+    await page.getByTestId("playground-close-button").click();
   },
 );

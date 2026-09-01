@@ -1,4 +1,5 @@
 import * as React from "react";
+import { PASSWORD_MANAGER_IGNORE_PROPS } from "@/utils/inputAutofill";
 import { cn } from "../../utils/utils";
 
 export interface TextareaProps
@@ -10,11 +11,15 @@ export interface TextareaProps
 const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
   ({ className, password, editNode, ...props }, ref) => {
     return (
-      <div className="w-full">
+      <div className="h-full w-full">
         <textarea
           data-testid="textarea"
+          // Suppress autofill: node-config textareas (prompts, descriptions)
+          // are not web forms; an injected value would be autosaved.
+          autoComplete="off"
+          {...PASSWORD_MANAGER_IGNORE_PROPS}
           className={cn(
-            "nopan nodelete nodrag noflow textarea-primary nowheel !max-h-fit resize-y",
+            "nopan nodelete nodrag noflow textarea-primary nowheel",
             className,
             password ? "password" : "",
           )}

@@ -5,13 +5,21 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from lfx.log.logger import logger
-from lfx.schema.openai_responses_schemas import create_openai_error
+from lfx.observability import execution_protocol
+from lfx.schema.openai_responses_schemas import create_openai_error, create_openai_error_chunk
+from lfx.utils.flow_validation import CustomComponentValidationError
+from lfx.workflow.end_user_identity import (
+    EndUserIdentityRequiredError,
+    end_user_required_detail,
+    resolve_serving_scope,
+)
 
 from langflow.api.utils import extract_global_variables_from_headers
-from langflow.api.v1.endpoints import consume_and_yield, run_flow_generator, simple_run_flow
+from langflow.api.utils.execution_errors import error_for_client
+from langflow.api.v1.endpoints import _caller_owns_flow, consume_and_yield, run_flow_generator, simple_run_flow
 from langflow.api.v1.schemas import SimplifiedAPIRequest
 from langflow.events.event_manager import create_stream_tokens_event_manager
 from langflow.helpers.flow import get_flow_by_id_or_endpoint_name
@@ -23,6 +31,7 @@ from langflow.schema import (
 )
 from langflow.schema.content_types import ToolContent
 from langflow.services.auth.utils import api_key_security
+from langflow.services.authorization import FlowAction, ensure_flow_permission
 from langflow.services.database.models.flow.model import FlowRead
 from langflow.services.database.models.user.model import UserRead
 from langflow.services.deps import get_telemetry_service
@@ -30,6 +39,15 @@ from langflow.services.telemetry.schema import RunPayload
 from langflow.services.telemetry.service import TelemetryService
 
 router = APIRouter(tags=["OpenAI Responses API"])
+
+
+def _flow_not_found_response(model: str) -> OpenAIErrorResponse:
+    error_response = create_openai_error(
+        message=f"Flow with id '{model}' not found",
+        type_="invalid_request_error",
+        code="flow_not_found",
+    )
+    return OpenAIErrorResponse(error=error_response["error"])
 
 
 def has_chat_input(flow_data: dict | None) -> bool:
@@ -55,8 +73,10 @@ async def run_flow_for_openai_responses(
     *,
     stream: bool = False,
     variables: dict[str, str] | None = None,
+    http_request: Request | None = None,
 ) -> OpenAIResponsesResponse | StreamingResponse:
     """Run a flow for OpenAI Responses API compatibility."""
+    expose_error_details = _caller_owns_flow(flow, api_key_user)
     # Check if flow has chat input
     if not has_chat_input(flow.data):
         msg = "Flow must have a ChatInput component to be compatible with OpenAI Responses API"
@@ -74,7 +94,7 @@ async def run_flow_for_openai_responses(
     context = {}
     if variables:
         context["request_variables"] = variables
-        await logger.adebug(f"Added request variables to context: {variables}")
+        await logger.adebug(f"Added request variables to context: {list(variables.keys())}")
 
     # Convert OpenAI request to SimplifiedAPIRequest
     # Note: We're moving away from tweaks to a context-based approach
@@ -88,7 +108,7 @@ async def run_flow_for_openai_responses(
 
     # Context will be passed separately to simple_run_flow
 
-    await logger.adebug(f"SimplifiedAPIRequest created with context: {context}")
+    await logger.adebug(f"SimplifiedAPIRequest created with context keys: {list(context.keys())}")
 
     # Use session_id as response_id for OpenAI compatibility
     response_id = session_id
@@ -102,16 +122,21 @@ async def run_flow_for_openai_responses(
 
         async def openai_stream_generator() -> AsyncGenerator[str, None]:
             """Convert Langflow events to OpenAI Responses API streaming format."""
-            main_task = asyncio.create_task(
-                run_flow_generator(
-                    flow=flow,
-                    input_request=simplified_request,
-                    api_key_user=api_key_user,
-                    event_manager=event_manager,
-                    client_consumed_queue=asyncio_queue_client_consumed,
-                    context=context,
+            # Around the create_task only: the task copies the context at creation, and there is
+            # no await inside the scope, so nothing straddles a suspension point of this generator.
+            with execution_protocol("openai_responses"):
+                main_task = asyncio.create_task(
+                    run_flow_generator(
+                        flow=flow,
+                        input_request=simplified_request,
+                        api_key_user=api_key_user,
+                        event_manager=event_manager,
+                        client_consumed_queue=asyncio_queue_client_consumed,
+                        context=context,
+                        expose_error_details=expose_error_details,
+                        http_request=http_request,
+                    )
                 )
-            )
 
             try:
                 await logger.adebug(
@@ -132,6 +157,7 @@ async def run_flow_for_openai_responses(
                 tool_call_counter = 0
                 processed_tools = set()  # Track processed tool calls to avoid duplicates
                 previous_content = ""  # Track content already sent to calculate deltas
+                stream_usage_data = None  # Track usage from completed message
 
                 async for event_data in consume_and_yield(asyncio_queue, asyncio_queue_client_consumed):
                     if event_data is None:
@@ -161,18 +187,31 @@ async def run_flow_for_openai_responses(
                                 # Handle add_message events
                                 if event_type == "token":
                                     token_data = data.get("chunk", "")
+                                    if isinstance(token_data, str):
+                                        previous_content += token_data
                                     await logger.adebug(
                                         "[OpenAIResponses][stream] token: token_data=%s",
                                         token_data,
                                     )
                                 if event_type == "error":
-                                    error_message = data.get("error", "Unknown error")
-                                    await logger.adebug(f"[OpenAIResponses][stream] error event: {error_message}")
-                                    error_response = create_openai_error(
-                                        message=error_message,
-                                        type_="processing_error",
+                                    # Error message is in 'text' field, not 'error' field
+                                    # The 'error' field is a boolean flag
+                                    error_message = data.get("text") or data.get("error", "Unknown error")
+                                    # Ensure error_message is a string
+                                    if not isinstance(error_message, str):
+                                        error_message = str(error_message)
+                                    # Send error as content chunk with finish_reason="error"
+                                    # This ensures OpenAI SDK can parse and surface the error
+                                    error_chunk = create_openai_error_chunk(
+                                        response_id=response_id,
+                                        created_timestamp=created_timestamp,
+                                        model=request.model,
+                                        error_message=error_message,
                                     )
-                                    yield f"data: {json.dumps(error_response)}\n\n"
+                                    yield f"data: {error_chunk.model_dump_json()}\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    # Exit early after error
+                                    return
 
                                 if event_type == "add_message":
                                     sender_name = data.get("sender_name", "")
@@ -201,6 +240,19 @@ async def run_flow_for_openai_responses(
                                         await logger.adebug(
                                             "[OpenAIResponses][stream] skipping add_message with state=complete"
                                         )
+                                        # Extract usage from completed message properties
+                                        if isinstance(properties, dict) and "usage" in properties:
+                                            usage_obj = properties.get("usage")
+                                            if usage_obj and isinstance(usage_obj, dict):
+                                                # Convert None values to 0 for compatibility
+                                                stream_usage_data = {
+                                                    "input_tokens": usage_obj.get("input_tokens") or 0,
+                                                    "output_tokens": usage_obj.get("output_tokens") or 0,
+                                                    "total_tokens": usage_obj.get("total_tokens") or 0,
+                                                }
+                                                await logger.adebug(
+                                                    "[OpenAIResponses][stream] captured usage: %s", stream_usage_data
+                                                )
                                         # Still process content_blocks for tool calls, but skip text content
                                         text = ""
 
@@ -377,22 +429,44 @@ async def run_flow_for_openai_responses(
                     model=request.model,
                     delta={},
                     status="completed",
+                    finish_reason="stop",
                 )
                 yield f"data: {final_chunk.model_dump_json()}\n\n"
+
+                # Send response.completed event with usage (OpenAI format)
+                completed_event = {
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": created_timestamp,
+                        "status": "completed",
+                        "model": request.model,
+                        "usage": stream_usage_data,
+                    },
+                }
+                yield f"event: response.completed\ndata: {json.dumps(completed_event)}\n\n"
+
                 yield "data: [DONE]\n\n"
                 await logger.adebug(
-                    "[OpenAIResponses][stream] completed: response_id=%s total_sent_len=%d",
+                    "[OpenAIResponses][stream] completed: response_id=%s total_sent_len=%d usage=%s",
                     response_id,
                     len(previous_content),
+                    stream_usage_data,
                 )
 
             except Exception as e:  # noqa: BLE001
-                logger.error(f"Error in stream generator: {e}")
-                error_response = create_openai_error(
-                    message=str(e),
-                    type_="processing_error",
+                await logger.aexception("Error in OpenAI Responses stream generator")
+                client_error = error_for_client(e, expose_details=expose_error_details)
+                # Send error as content chunk with finish_reason="error"
+                error_chunk = create_openai_error_chunk(
+                    response_id=response_id,
+                    created_timestamp=created_timestamp,
+                    model=request.model,
+                    error_message=str(client_error),
                 )
-                yield f"data: {error_response}\n\n"
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
             finally:
                 if not main_task.done():
                     main_task.cancel()
@@ -408,17 +482,21 @@ async def run_flow_for_openai_responses(
         )
 
     # Handle non-streaming response
-    result = await simple_run_flow(
-        flow=flow,
-        input_request=simplified_request,
-        stream=False,
-        api_key_user=api_key_user,
-        context=context,
-    )
+    with execution_protocol("openai_responses"):
+        result = await simple_run_flow(
+            flow=flow,
+            input_request=simplified_request,
+            stream=False,
+            api_key_user=api_key_user,
+            context=context,
+            expose_error_details=expose_error_details,
+            http_request=http_request,
+        )
 
-    # Extract output text and tool calls from result
+    # Extract output text, tool calls, and usage from result
     output_text = ""
     tool_calls: list[dict[str, Any]] = []
+    usage_data: dict[str, int] | None = None
     try:
         outputs_len = len(result.outputs) if getattr(result, "outputs", None) else 0
         await logger.adebug("[OpenAIResponses][non-stream] result.outputs len=%d", outputs_len)
@@ -430,13 +508,30 @@ async def run_flow_for_openai_responses(
             if run_output and run_output.outputs:
                 for component_output in run_output.outputs:
                     if component_output:
-                        # Handle messages (final chat outputs)
+                        # First, try to extract usage from results (contains actual Message objects)
+                        if hasattr(component_output, "results") and component_output.results:
+                            for value in component_output.results.values():
+                                # Extract usage from Message properties if available
+                                if (
+                                    not usage_data
+                                    and hasattr(value, "properties")
+                                    and hasattr(value.properties, "usage")
+                                    and value.properties.usage
+                                ):
+                                    usage_obj = value.properties.usage
+                                    usage_data = {
+                                        "input_tokens": getattr(usage_obj, "input_tokens", None) or 0,
+                                        "output_tokens": getattr(usage_obj, "output_tokens", None) or 0,
+                                        "total_tokens": getattr(usage_obj, "total_tokens", None) or 0,
+                                    }
+                                    break
+                        # Handle messages (final chat outputs) for text extraction
                         if hasattr(component_output, "messages") and component_output.messages:
                             for msg in component_output.messages:
                                 if hasattr(msg, "message"):
                                     output_text = msg.message
                                     break
-                        # Handle results
+                        # Handle results for text extraction if not found in messages
                         if not output_text and hasattr(component_output, "results") and component_output.results:
                             for value in component_output.results.values():
                                 if hasattr(value, "get_text"):
@@ -447,14 +542,22 @@ async def run_flow_for_openai_responses(
                                     break
 
                         if hasattr(component_output, "results") and component_output.results:
-                            for blocks in component_output.results.get("message", {}).content_blocks:
+                            message = component_output.results.get("message")
+                            for block in getattr(message, "content_blocks", None) or []:
+                                # The agent's flat log carries tool_use as top-level
+                                # ToolContent leaves; the legacy/grouped shape nests
+                                # them inside a group's ``contents``. Handle both.
+                                if isinstance(block, ToolContent):
+                                    leaves = [block]
+                                else:
+                                    leaves = getattr(block, "contents", None) or []
                                 tool_calls.extend(
                                     {
                                         "name": content.name,
                                         "input": content.tool_input,
                                         "output": content.output,
                                     }
-                                    for content in blocks.contents
+                                    for content in leaves
                                     if isinstance(content, ToolContent)
                                 )
                     if output_text:
@@ -463,9 +566,10 @@ async def run_flow_for_openai_responses(
                 break
 
     await logger.adebug(
-        "[OpenAIResponses][non-stream] extracted output_text_len=%d tool_calls=%d",
+        "[OpenAIResponses][non-stream] extracted output_text_len=%d tool_calls=%d usage=%s",
         len(output_text) if isinstance(output_text, str) else -1,
         len(tool_calls),
+        usage_data,
     )
 
     # Build output array
@@ -517,6 +621,7 @@ async def run_flow_for_openai_responses(
         model=request.model,
         output=output_items,
         previous_response_id=request.previous_response_id,
+        usage=usage_data,
     )
 
 
@@ -553,7 +658,6 @@ async def create_response(
 
     await logger.adebug(f"All headers received: {list(http_request.headers.keys())}")
     await logger.adebug(f"Extracted global variables from headers: {list(variables.keys())}")
-    await logger.adebug(f"Variables dict: {variables}")
 
     # Validate tools parameter - error out if tools are provided
     if request.tools is not None:
@@ -564,19 +668,51 @@ async def create_response(
         )
         return OpenAIErrorResponse(error=error_response["error"])
 
-    # Get flow using the model field (which contains flow_id)
+    # Get flow using the model field (which contains flow_id). The lookup
+    # becomes share-aware when an authorization plugin is registered, so we
+    # also enforce ``flow:execute`` explicitly — otherwise an API key with
+    # cross-user fetch enabled would skip policy here.
     try:
-        flow = await get_flow_by_id_or_endpoint_name(request.model, str(api_key_user.id))
+        flow = await get_flow_by_id_or_endpoint_name(
+            request.model,
+            str(api_key_user.id),
+            widen_for_shares=True,
+        )
     except HTTPException:
         flow = None
 
     if flow is None:
-        error_response = create_openai_error(
-            message=f"Flow with id '{request.model}' not found",
-            type_="invalid_request_error",
-            code="flow_not_found",
+        return _flow_not_found_response(request.model)
+
+    expose_error_details = _caller_owns_flow(flow, api_key_user)
+
+    try:
+        await ensure_flow_permission(
+            api_key_user,
+            FlowAction.EXECUTE,
+            flow_id=flow.id,
+            flow_user_id=flow.user_id,
+            workspace_id=getattr(flow, "workspace_id", None),
+            folder_id=getattr(flow, "folder_id", None),
         )
-        return OpenAIErrorResponse(error=error_response["error"])
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            return _flow_not_found_response(request.model)
+        raise
+
+    # Required-identity gate must fire BEFORE the run: create_response wraps the run in a blanket
+    # ``except Exception`` (below) that converts any raise — including the identity 401 from
+    # simple_run_flow — into an OpenAIErrorResponse returned at the route's default 200, and the
+    # streaming variant returns before the run even executes. Enforce it synchronously here so a
+    # required-but-absent identity is a real 401 (idempotent with the scope simple_run_flow applies
+    # again). Mirrors the webhook pre-check (I3). See BUG-01.
+    try:
+        resolve_serving_scope(http_request=http_request, requested_session_id=None, default_session_id=str(flow.id))
+    except EndUserIdentityRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=end_user_required_detail(exc),
+        ) from exc
 
     try:
         # Process the request
@@ -586,24 +722,32 @@ async def create_response(
             api_key_user=api_key_user,
             stream=request.stream,
             variables=variables,
+            http_request=http_request,
         )
 
-        # Log telemetry for successful completion
-        if not request.stream:  # Only log for non-streaming responses
-            end_time = time.perf_counter()
-            background_tasks.add_task(
-                telemetry_service.log_package_run,
-                RunPayload(
-                    run_is_webhook=False,
-                    run_seconds=int(end_time - start_time),
-                    run_success=True,
-                    run_error_message="",
-                    run_id=None,  # OpenAI endpoint doesn't use simple_run_flow
-                ),
-            )
+    except CustomComponentValidationError as exc:
+        await logger.aerror("OpenAI Responses custom-component validation failed: %s", exc, exc_info=True)
+        client_error = error_for_client(exc, expose_details=expose_error_details)
+        error_response = create_openai_error(
+            message=str(client_error),
+            type_="invalid_request_error",
+            code="custom_components_blocked",
+        )
+        return OpenAIErrorResponse(error=error_response["error"])
+
+    except ValueError as exc:
+        await logger.aerror("OpenAI Responses flow validation failed: %s", exc, exc_info=True)
+        client_error = error_for_client(exc, expose_details=expose_error_details)
+        error_response = create_openai_error(
+            message=str(client_error),
+            type_="invalid_request_error",
+            code="invalid_flow_request",
+        )
+        return OpenAIErrorResponse(error=error_response["error"])
 
     except Exception as exc:  # noqa: BLE001
-        logger.error(f"Error processing OpenAI Responses request: {exc}")
+        await logger.aexception("Error processing OpenAI Responses request")
+        client_error = error_for_client(exc, expose_details=expose_error_details)
 
         # Log telemetry for failed completion
         background_tasks.add_task(
@@ -619,8 +763,23 @@ async def create_response(
 
         # Return OpenAI-compatible error
         error_response = create_openai_error(
-            message=str(exc),
+            message=str(client_error),
             type_="processing_error",
         )
         return OpenAIErrorResponse(error=error_response["error"])
+
+    # Log telemetry for successful completion
+    if not request.stream:  # Only log for non-streaming responses
+        end_time = time.perf_counter()
+        background_tasks.add_task(
+            telemetry_service.log_package_run,
+            RunPayload(
+                run_is_webhook=False,
+                run_seconds=int(end_time - start_time),
+                run_success=True,
+                run_error_message="",
+                run_id=None,  # OpenAI endpoint doesn't use simple_run_flow
+            ),
+        )
+
     return result

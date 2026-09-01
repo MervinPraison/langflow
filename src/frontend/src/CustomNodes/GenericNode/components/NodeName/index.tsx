@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import ForwardedIconComponent from "@/components/common/genericIconComponent";
 import ShadTooltip from "@/components/common/shadTooltipComponent";
 import { Input } from "@/components/ui/input";
@@ -27,6 +28,7 @@ export default function NodeName({
   toggleEditNameDescription: () => void;
   setHasChangedNodeDescription: (hasChanged: boolean) => void;
 }) {
+  const { t } = useTranslation();
   const [nodeName, setNodeName] = useState<string>(display_name ?? "");
   const takeSnapshot = useFlowsManagerStore((state) => state.takeSnapshot);
   const setNode = useFlowStore((state) => state.setNode);
@@ -97,7 +99,10 @@ export default function NodeName({
         )}
       >
         <div className="flex cursor-grab items-center gap-2">
-          <span className={cn("cursor-grab truncate text-sm")}>
+          <span
+            className={cn("cursor-grab truncate text-base")}
+            data-testid="node-name"
+          >
             {display_name}
           </span>
           {legacy && (
@@ -111,7 +116,7 @@ export default function NodeName({
       </div>
       {beta && (
         <div className="shrink-0">
-          <ShadTooltip content="Beta component">
+          <ShadTooltip content={t("node.betaComponent")}>
             <div className="flex h-4 w-4 items-center justify-center rounded-sm border border-accent-purple-foreground p-0.5">
               <ForwardedIconComponent
                 name="FlaskConical"
